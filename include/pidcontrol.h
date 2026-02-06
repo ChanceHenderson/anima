@@ -146,11 +146,10 @@ public:
         // Undo integral step if saturated in direction of error
         if ((saturated_high && error > 0.0f) || (saturated_low && error < 0.0f))
         {
-            // Remove the newest sample from integralSum to prevent windup
+            // Remove the newest sample from integral_sum to prevent windup
             pidstate.integral_sum -= pidstate.integral_buffer[(pidstate.index + INTEGRAL_WINDOW - 1) % INTEGRAL_WINDOW];
             pidstate.integral_buffer[(pidstate.index + INTEGRAL_WINDOW - 1) % INTEGRAL_WINDOW] = 0.0f;
         }
-        //Serial.println("PID Output: " + String(output) + " (P: " + String(Kp * error) + ", I: " + String(Ki * integral) + ", D: " + String(Kd * derivative) + ", FF: " + String(ff) + ")");
         return (uint32_t)(output + 0.5f); // floats truncate when being cast to int - e.g 1.9 becomes 1. by adding 0.5 first, we accomplish rounding to the nearest int instead.
 
     }

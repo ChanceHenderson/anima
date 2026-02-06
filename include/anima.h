@@ -5,155 +5,191 @@
 #include <ClickButton.h>
 #include <servo.h>
 #include <Adafruit_SSD1306.h>
+#include <LittleFS.h>
 #include "flywheelmotor.h"
 
+// Plus motors have 14 poles. Change this if you're using different motors.
 const byte MOTOR_POLES = 14;
-#define PIN_OLED_SDA 20
-#define PIN_OLED_SCL 21
-#define PIN_FIRE_IN 5
-#define PIN_REV_IN 7
-#define PIN_MENU_IN 6
-#define PIN_ESC_1_OUT 10
-#define PIN_ESC_2_OUT 12
-#define PIN_SOLENOID_OUT 11
+// Currently set up for the Trifolium board
+// Connect 8-pin connector between Trifolium and ESC
+// Connect OLED to the 4-pin header on the side of the board
+// Connect the trigger pack to the 4-pin header in the center of the board
+// If you're using a mosfet board, connect the gate to the 2-pin header labeled "18" (and G)
+#define PIN_OLED_SDA 14
+#define PIN_OLED_SCL 15
+#define PIN_FIRE_IN 8
+#define PIN_REV_IN 10
+#define PIN_MENU_IN 9
+#define PIN_ESC_1_OUT 0
+#define PIN_ESC_2_OUT 2
+#define PIN_SOLENOID_OUT 1
+#define PIN_UNUSED_ESC_OUT 3
+#define PIN_ESC_CURRENT 4
+#define PIN_ESC_TELEMETRY 26
+#define PIN_VOLTAGE_IN 28
 #define AVERAGE_WINDOW 200
 
-const unsigned int HIGH_POWER = 38000;  //target RPM hi power
-const unsigned int MID_POWER = 30000;  //target RPM med power
-const unsigned int LOW_POWER = 20000;  //target RPM low power
-const unsigned int IDLE_RPM = 8000;  //target RPM IDLE
-
-const byte PROFILE_LOW = 0;
-const byte PROFILE_MED = 1;
-const byte PROFILE_HIGH = 2;
-const byte PROFILE_T = 3;
-
-#define REV_FAIL_TIMER 1000
-#define SPINUP_RPM_THRESHOLD 500
-#define BATTERY_CHECK_MS 5000
-#define REV_SAFETY_TIMEOUT 15000
-#define THROTTLE_UPDATE_US 200
-
-#define MAX_RPM 45000
-#define MIN_RPM 5000
-#define RPM_STEP_SIZE 200
-
-#define MAX_FIRE_RATE 16
-#define MIN_FIRE_RATE 4
-
-#define SEMI 1
-#define AUTO 2
-#define BINARY 3
-
-// Structure Definitions
-typedef struct {
-    unsigned int profile_rpm;
-    byte fire_rate;
-    unsigned int post_shot_rev_ms;
-} Profile;
-
-// Function Declarations
-void load_profile(byte profile);
-void save_current_profile();
-void fire();
-void display_main();
-void display_settings(byte selected);
-
-volatile byte noid_extend_ms = 17; // power pulse time for solenoid
-
-const Profile DEFAULT_PROFILES[4] PROGMEM = {
-  { LOW_POWER, 8, 500 },    // Low
-  { MID_POWER, 10, 500 },   // Medium
-  { HIGH_POWER, 15, 500 },  // High
-  { HIGH_POWER, 15, 500 }   // Tournament
-};
-
-volatile byte MAX_ROF_DELAY = ceil((1000 - (MAX_FIRE_RATE * noid_extend_ms)) / MAX_FIRE_RATE);
+#define PIN_SOLENOID_MOSFET 18      // if USE_ESC_SOLENOID is false, use this pin for your mosfet gate
+const bool USE_ESC_SOLENOID = true; // set to false if you're using a mosfet board
 
 ClickButton trig(PIN_FIRE_IN, LOW, CLICKBTN_PULLUP);  //trigger button
 ClickButton menu(PIN_MENU_IN, LOW, CLICKBTN_PULLUP);  //menu button
 ClickButton rev(PIN_REV_IN, LOW, CLICKBTN_PULLUP);    //rev button
-Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+Adafruit_SSD1306 oled(128, 64, &Wire1, -1);  // the screen
 
+// Default Profile settings
+const unsigned int HIGH_POWER = 30000;  //target RPM hi power
+const unsigned int MID_POWER = 20000;  //target RPM med power
+const unsigned int LOW_POWER = 12000;  //target RPM low power
+const unsigned int IDLE_RPM = 3000;  //target RPM IDLE
+
+// Other Profile stuff
+const byte PROFILE_LOW = 0;
+const byte PROFILE_MED = 1;
+const byte PROFILE_HIGH = 2;
+const byte PROFILE_T = 3;
+typedef struct
+{
+    uint32_t profile_rpm;
+    uint8_t fire_rate;
+    uint32_t post_shot_rev_ms;
+    bool use_idle;
+} Profile;
+
+const Profile DEFAULT_PROFILES[4] PROGMEM =
+{
+  { LOW_POWER, 8, 500, false },    // Low
+  { MID_POWER, 10, 500, false },   // Medium
+  { HIGH_POWER, 15, 500, false },  // High
+  { HIGH_POWER, 15, 500, false }   // Tournament
+};
+
+const char* PROFILE_PATHS[4] =
+{
+  "/profile_low.cfg",
+  "/profile_med.cfg",
+  "/profile_high.cfg",
+  "/profile_tourney.cfg"
+};
+
+void load_profile(uint8_t profile_num);
+void save_current_profile(uint8_t profile_num);
+volatile bool save_requested = false;
 byte current_profile = PROFILE_HIGH;
 unsigned int profile_rpm = HIGH_POWER;                                             //target RPM value
 byte fire_rate = 15;                                                               //target fire rate (darts per second)
-byte single_shot_delay = ceil((1000 - (fire_rate * noid_extend_ms)) / fire_rate);  //how long to wait after powering solenoid before it can be powered again
-byte mode = SEMI;                                                                  //fire mode
+bool use_idle = false;                                                             // should motors idle between shots                   
 unsigned int post_shot_rev_duration_ms = 500;                                      //how long to wait before powering off flywheels after firing
 
+// Used for settings screen
+#define MAX_RPM 42000
+#define MIN_RPM 9000
+#define RPM_STEP_SIZE 200
+#define MAX_FIRE_RATE 16
+#define MIN_FIRE_RATE 4
+#define MIN_POST_SHOT_REV_MS 0
+#define MAX_POST_SHOT_REV_MS 2000
+
+// Voltage reading
+float voltage_readings[10] = {0,0,0,0,0,0,0,0,0,0};
+int voltage_index = 0;
+#define BATTERY_CHECK_MS 200
+const float LOW_BATTERY_THRESHOLD = 14.8;
+bool low_batt = false;                  //when true, low battery condition has been tripped. lock blaster for recharge
+unsigned long last_battery_check = 0;   //timestamp of last battery voltage check
+float voltage = 0.0;                    //numerical voltage
+
+#define REV_FAIL_TIMER 1000
+#define SPINUP_RPM_THRESHOLD 500
+#define SCREEN_UPDATE_MS 1000
+#define REV_SAFETY_TIMEOUT 15000
+#define THROTTLE_UPDATE_US 200
+
+// Fire modes
+#define SEMI 1
+#define AUTO 2
+#define BINARY 3
+byte mode = SEMI;   //fire mode
+
+// Display stuff
+void display_main();
+void display_settings(byte selected);
 unsigned int shot_count = 0;      //fired counter
+bool lock = false;                //mode locked? when true, fire mode cannot be changed
+bool update_display = true;             //when true, write display buffer to screen in the next loop
+
+// Options menu stuff
 byte selected = 1;                //menu selection
 bool settings = false;            //in settings mode?
+
+// Firing control stuff
+bool presently_idling = false;    //flywheels pre-rev/idle? (tournament mode)
 bool manual_rev_active = false;   //user holding the rev trigger?
-bool idle = false;                //flywheels pre-rev/idle? (tournament mode)
 bool fired = false;               //shot was fired? prevent additional shots until trigger reset (for all non fully-automatic fire modes)
-bool lock = false;                //mode locked? when true, fire mode cannot be changed
-bool tourney = false;             //when true, restrict available fire modes for competitive play
-bool low_batt = false;            //when true, low battery condition has been tripped. lock blaster for recharge
-bool update_display = true;             //when true, write display buffer to screen in the next loop
 unsigned long spin_down_timer = 0;      //counts up while the flywheels are spinning down
 unsigned long last_rev_timestamp = 0;   //stores timestamp of last revved
-unsigned long last_battery_check = 0;   //timestamp of last battery voltage check
 unsigned long last_fire_timestamp = 0;  //stores timestamp of last solenoid fire
 unsigned long safety_timer = 0;         //counts up while revving for safety shutoff
-float voltage = 0.0;                    //numerical voltage
-struct repeating_timer timer;
 bool revved = false;
 
+// PID constants and feedforward curve parameters
 const float Kp = .6;            // throttle per RPM
-const float Ki = 1.6;             // throttle / (RPM * s) (was 1.2)
-const float Kd = 0.0003;          // throttle*s / RPM (was 0.0003)
+const float Ki = 1.6;             // throttle / (RPM * s)
+const float Kd = 0.0003;          // throttle*s / RPM
 const float feed_forward_curve_offset = 56074.0f;   // the throttle/rpm curve for plus motors, robo spirit wheels, and a 4s battery
 const float feed_forward_curve_exponent = 12952.0f; // was measured to be *about* RPM = -56074 + 12952 ln(throttle)
-const float max_acceleration_rpm_per_us = 1.0f; // used to restrict which RPM measurements are valid - don't accept RPM changes faster than this
-const float max_deceleration_rpm_per_us = 0.5f; // used to restrict which RPM measurements are valid - don't accept RPM changes faster than this
+
+// Motor stuff
 FlywheelMotor *left_motor;
 FlywheelMotor *right_motor;
+// Used to reduce the number of mutex locking needed - motor control loop writes these, main thread reads them
 volatile uint16_t current_rpm_left;
 volatile uint16_t current_rpm_right;
 volatile bool motors_initialized = false;
-uint32_t staged_rpm = 0;
 
-void reset();
+void reset(); // reboots the board
 void core1_main(); // Core 1 handles UI and control logic
-void initialize_motors(); // Initialize motors after mode selection
+void initialize_motors(); // Initialize motors (dshot and whatnot)
 
-// Thread-safe functions for Core 1 to access motor data
-void safe_set_target_rpm(uint32_t rpm);
-void safe_get_rpm_and_throttle(uint16_t* left_rpm, uint16_t* right_rpm, uint16_t* left_throttle, uint16_t* right_throttle);
+// Wheel motor control functions
+void set_target_rpm(uint32_t rpm);
 void rev_down();
 
 /* SOLENOID STUFF */
-// High-frequency servo PWM control (480Hz, 1050-1950us pulses)
-volatile uint16_t solenoid_throttle_us = 1500; // Default to center in microseconds
-uint16_t noid_extend_duration_ms = 20; // Duration to keep solenoid extended in milliseconds
-
-// Servo throttle values in microseconds
-const uint16_t SOLENOID_OFF = 1500;      // Center position
-const uint16_t SOLENOID_ON_HIGH = 1950;  // Extended high
-const uint16_t SOLENOID_ON_LOW = 1050;   // Extended low
-uint16_t nextSolenoidOn = SOLENOID_ON_HIGH;
+uint8_t noid_extend_ms = 25; // power pulse time for solenoid - this is dynamic based on voltage
+const uint8_t noid_retract_ms = 35; // time to wait after retracting solenoid before next action
+volatile byte MAX_ROF_DELAY = ceil((1000 - (MAX_FIRE_RATE * noid_extend_ms)) / MAX_FIRE_RATE);
+byte single_shot_delay = ceil((1000 - (fire_rate * noid_extend_ms)) / fire_rate);  //how long to wait after powering solenoid before it can be powered again
 
 // PWM configuration for ~480Hz servo signal  
-// Assumes default Arduino Pico clock ~133MHz (observed from measurements)
+// Assumes default Arduino Pico clock ~133MHz
 // RP2040 PWM counts from 0 to WRAP (inclusive), so period = (WRAP+1) * divider / clock
 // WRAP=4322 with divider=64 gives ~2080us period (~481Hz)
 const float PWM_CLOCK_DIV = 64.0f;
 const uint PWM_WRAP = 4322;    // ~2080us period, ~481Hz
-const uint PWM_MIN = 2182;     // 1050us pulse width
-const uint PWM_MAX = 4050;     // 1950us pulse width
+const uint PWM_MIN = 2099;     // 1010us pulse width
+const uint PWM_MAX = 4136;     // 1990us pulse width
 const uint PWM_CENTER = 3118;  // 1500us pulse width
+
+// Servo throttle values in microseconds
+const uint16_t SOLENOID_OFF = PWM_CENTER;   // Center position
+const uint16_t SOLENOID_ON_HIGH = PWM_MAX;  // Extended high
+const uint16_t SOLENOID_ON_LOW = PWM_MIN;   // Extended low
+uint16_t nextSolenoidOn = SOLENOID_ON_HIGH;
 uint slice_num;
 uint channel_num;
 
+// Solenoid control functions
+void fire();
 void set_solenoid_pwm(uint16_t throttle_us);
 void extendNoid();
 void retractNoid();
 void fireNoid();
 /* END SOLENOID STUFF */
+
 void main_loop();
 
+// The bootup splash screen
 const unsigned char splash[] PROGMEM = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

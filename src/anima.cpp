@@ -8,6 +8,7 @@
 #include <Arduino.h>
 #include "anima.h"
 #include <Adafruit_SSD1306.h>
+#include <bits/stdc++.h>
 #include <ClickButton.h>
 //#include <EEPROM.h>
 #include <PIO_DShot.h>
@@ -31,6 +32,8 @@
 
 // Mutex for safe motor access between cores
 auto_init_mutex(motor_mutex);
+// Mutex for saving
+auto_init_mutex(save_mutex);
 
 typedef struct
 {
@@ -42,42 +45,117 @@ typedef struct
 } LogMessage;
 
 
-void load_profile(byte profile) 
+void load_profile(uint8_t profile_num) 
 {
-  /*
-  if (EEPROM.read(profile * sizeof(Profile)) == 0xFF) {
-    Profile default_profile;
-    memcpy_P(&default_profile, &DEFAULT_PROFILES[profile], sizeof(Profile));
-    EEPROM.put(profile * sizeof(Profile), default_profile);
+  Profile loaded_profile;  
+  // Try to load from filesystem
+  if (LittleFS.begin()) 
+  {
+    Serial.println("LittleFS Begin successful");
+    if (LittleFS.exists(PROFILE_PATHS[profile_num]))
+    {
+      Serial.println("Profile file exists");
+      File f = LittleFS.open(PROFILE_PATHS[profile_num], "r");
+      if (f)
+      {
+        if (f.size() == sizeof(Profile))
+        {
+          f.read((uint8_t*)&loaded_profile, sizeof(Profile));
+          f.close();
+          if (loaded_profile.profile_rpm >= MIN_RPM && loaded_profile.profile_rpm <= MAX_RPM &&
+              loaded_profile.fire_rate >= MIN_FIRE_RATE && loaded_profile.fire_rate <= MAX_FIRE_RATE &&
+              loaded_profile.post_shot_rev_ms >= MIN_POST_SHOT_REV_MS && loaded_profile.post_shot_rev_ms <= MAX_POST_SHOT_REV_MS)
+          {
+            LittleFS.end();
+            // Apply settings
+            profile_rpm = loaded_profile.profile_rpm;
+            fire_rate = loaded_profile.fire_rate;
+            post_shot_rev_duration_ms = loaded_profile.post_shot_rev_ms;
+            use_idle = loaded_profile.use_idle;
+            return;
+          }
+          else
+          {
+            Serial.println("Profile file contains invalid values, using defaults");
+          }
+        }
+        else if (f.size() != sizeof(Profile))
+        {
+          Serial.println("Profile file size incorrect, using defaults");
+          f.close();
+          LittleFS.remove(PROFILE_PATHS[profile_num]); // Delete corrupted file
+        }
+      }
+      else
+      {
+        Serial.println("Profile file open failed, using defaults");
+      }
+      if (f) f.close();
+    }
+    LittleFS.end();
   }
-
-  // Load profile from EEPROM
-  Profile loaded_profile;
-  EEPROM.get(profile * sizeof(Profile), loaded_profile);
-
-  // Apply settings
+  else
+  {
+    Serial.println("LittleFS Begin failed");
+  }
+  // If we get here, use defaults
+  memcpy_P(&loaded_profile, &DEFAULT_PROFILES[profile_num], sizeof(Profile));
   profile_rpm = loaded_profile.profile_rpm;
   fire_rate = loaded_profile.fire_rate;
   post_shot_rev_duration_ms = loaded_profile.post_shot_rev_ms;
-  */
+  use_idle = loaded_profile.use_idle;
 }
 
 void check_battery()
 {
+  voltage_index++;
+  voltage_readings[voltage_index%10] = (float)analogRead(PIN_VOLTAGE_IN) * 3.3 / 4096.0 * 11.0;;
+  float average_voltage = 0.0;
+  float divisor = (float)std::min(voltage_index, 10);
+  for (int i = 0; i < divisor; i++) 
+  {
+      average_voltage += voltage_readings[i];
+  }
+  average_voltage /= divisor;
+  voltage = average_voltage;
 }
 
-void save_current_profile() 
+void save_current_profile(uint8_t profile_num) 
 {
   Profile current_settings = {
     profile_rpm,
     fire_rate,
-    post_shot_rev_duration_ms
+    post_shot_rev_duration_ms,
+    use_idle
   };
-  //EEPROM.put(current_profile * sizeof(Profile), current_settings);
+  
+  if (LittleFS.begin())
+  {
+    Serial.println("LittleFS Begin successful for save");
+    File f = LittleFS.open(PROFILE_PATHS[profile_num], "w");
+    if (f)
+    {
+      Serial.println("Profile file opened for writing");
+      f.write((uint8_t*)&current_settings, sizeof(Profile));
+      f.close();
+    }
+    LittleFS.end();
+  }
+  else
+  {
+    Serial.println("LittleFS Begin failed for save");
+  }
+}
+
+void set_solenoid_pwm(uint16_t throttle_us) 
+{
+    pwm_set_chan_level(slice_num, channel_num, throttle_us);
 }
 
 void extendNoid() 
 {
+  if (USE_ESC_SOLENOID)
+  {
     set_solenoid_pwm(nextSolenoidOn);
     if (nextSolenoidOn == SOLENOID_ON_HIGH) 
     {
@@ -87,22 +165,60 @@ void extendNoid()
     {
         nextSolenoidOn = SOLENOID_ON_HIGH;
     }
+  }
+  else
+  {
+    digitalWrite(PIN_SOLENOID_MOSFET, HIGH);
+  }
 }
 
 void retractNoid() 
 {
+  if (USE_ESC_SOLENOID)
+  {
     set_solenoid_pwm(SOLENOID_OFF);
+  }
+  else
+  {
+    digitalWrite(PIN_SOLENOID_MOSFET, LOW);
+  }
 }
 
 void fireNoid() 
 {
     extendNoid();
-    delay(noid_extend_duration_ms);
+    delay(noid_extend_ms);
     retractNoid();
+    delay(noid_retract_ms);
+}
+
+void reset()
+{
+    // Use watchdog to reboot - handles multi-core cleanup automatically
+    watchdog_reboot(0, 0, 0);
+    while(1); // Wait for watchdog to trigger reset
+}
+
+void fire()
+{
+    fireNoid();
+    last_fire_timestamp = millis();
+    shot_count += 1;
+    update_display = true;
+    
+    // Apply fire rate delay (only for non-full-auto modes)
+    if (mode == SEMI || mode == BINARY)
+    {
+        delay(MAX_ROF_DELAY);
+    }
+    else if (mode == AUTO)
+    {
+        delay(single_shot_delay);
+    }
 }
 
 // Safe wrapper functions for Core 1 to access motor data
-void safe_set_target_rpm(uint32_t rpm) 
+void set_target_rpm(uint32_t rpm) 
 {
     mutex_enter_blocking(&motor_mutex);
     if (left_motor != nullptr) 
@@ -116,27 +232,31 @@ void safe_set_target_rpm(uint32_t rpm)
     mutex_exit(&motor_mutex);
 }
 
-void safe_get_rpm_and_throttle(uint16_t* left_rpm, uint16_t* right_rpm, uint16_t* left_throttle, uint16_t* right_throttle) 
-{
-    mutex_enter_blocking(&motor_mutex);
-    if (left_motor != nullptr) 
-    {
-        *left_rpm = left_motor->get_current_rpm();
-        *left_throttle = left_motor->control_algorithm->get_throttle();
-    }
-    if (right_motor != nullptr) 
-    {
-        *right_rpm = right_motor->get_current_rpm();
-        *right_throttle = right_motor->control_algorithm->get_throttle();
-    }
-    mutex_exit(&motor_mutex);
-}
 
 void setup()
 {
     // Core 0 runs setup() by default on Arduino
     Serial.begin(115200);
     Serial.printf("Core 0: Starting setup on Core 0\n");
+    if (digitalRead(PIN_MENU_IN) == LOW && digitalRead(PIN_FIRE_IN) == HIGH)
+    {
+      current_profile = PROFILE_LOW;
+    } 
+    else if (digitalRead(PIN_MENU_IN) == HIGH && digitalRead(PIN_FIRE_IN) == LOW) 
+    {
+      current_profile = PROFILE_MED;
+    } 
+    else if (digitalRead(PIN_MENU_IN) == LOW && digitalRead(PIN_FIRE_IN) == LOW) 
+    {
+      current_profile = PROFILE_T;
+      menu.longClickTime = 500;
+    }
+    else
+    {
+      current_profile = PROFILE_HIGH;
+    }
+    load_profile(current_profile);
+    Serial.printf("Core 0: Loaded profile %d\n", current_profile);
     // Launch Core 1 for UI and control logic
     multicore_launch_core1(core1_main);
 }
@@ -144,9 +264,9 @@ void setup()
 // Initialize motors and solenoid (called from Core 1 after mode selection)
 void initialize_motors() 
 {
-    left_motor = new FlywheelMotor(PIN_ESC_1_OUT, MOTOR_POLES,  max_acceleration_rpm_per_us, max_deceleration_rpm_per_us, new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
-    right_motor = new FlywheelMotor(PIN_ESC_2_OUT, MOTOR_POLES, max_acceleration_rpm_per_us, max_deceleration_rpm_per_us, new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
-    // Initialize PWM for solenoid (high-frequency servo, 480Hz)
+    left_motor = new FlywheelMotor(PIN_ESC_1_OUT, MOTOR_POLES,  new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
+    right_motor = new FlywheelMotor(PIN_ESC_2_OUT, MOTOR_POLES, new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
+    // Initialize PWM for solenoid (high-frequency servo, 480Hz
     gpio_set_function(PIN_SOLENOID_OUT, GPIO_FUNC_PWM);
     slice_num = pwm_gpio_to_slice_num(PIN_SOLENOID_OUT);
     channel_num = pwm_gpio_to_channel(PIN_SOLENOID_OUT);
@@ -185,16 +305,14 @@ void initialize_motors()
 
 void rev_down() 
 {
-  if (tourney && !idle) 
+  if (use_idle && !presently_idling) 
   {
-    idle = true;
-    staged_rpm = IDLE_RPM;
-    safe_set_target_rpm(staged_rpm);
+    presently_idling = true;
+    set_target_rpm(IDLE_RPM);
   } 
-  else if (!tourney) 
+  else if (!use_idle) 
   {
-    staged_rpm = 0;
-    safe_set_target_rpm(staged_rpm);
+    set_target_rpm(0);
   }
   revved = false;
   last_rev_timestamp = millis();
@@ -203,6 +321,10 @@ void rev_down()
 
 void main_loop() 
 {
+  if (low_batt) 
+  {
+    set_target_rpm(0);
+  }
   //read button states
   trig.Update();
   menu.Update();
@@ -220,9 +342,17 @@ void main_loop()
       //update target RPM in case it was changed on settings screen
       if (!settings)
       {
-        staged_rpm = profile_rpm;
-        safe_set_target_rpm(staged_rpm);
+        if (use_idle)
+        {
+          set_target_rpm(IDLE_RPM);
+          presently_idling = true;
+        }
       }
+      else
+      {
+        set_target_rpm(0);  // Stop motors in settings mode
+      }
+      
     } 
     else if (menu.clicks > 0 && !settings && !lock)
     {
@@ -237,36 +367,81 @@ void main_loop()
   }
 
   //trigger button handling
-  //if not in settings mode, while trigger is pressed, spin up the flywheels and fire
+  //if not in settings mode, handle rev and fire triggers
   if (!settings)
   {
-    //if in tourney mode and flywheel speed set to idle RPM, spin up the flywheels for pre-rev
-    if (tourney && idle) 
-    {
-      
-    }
-    // Rev trigger pressed but nothing else is
-    if (rev.depressed && !menu.depressed && !trig.depressed && !low_batt)
+    // ========== REV TRIGGER HANDLING ==========
+    // Rev trigger held: spin up to profile RPM
+    if (rev.depressed && !menu.depressed && !low_batt)
     {
       manual_rev_active = true;
-      staged_rpm = profile_rpm;
-      safe_set_target_rpm(staged_rpm);
+      if (use_idle && presently_idling)
+      {
+        // Tournament mode: transition from idle to full speed
+        presently_idling = false;
+      }
+      set_target_rpm(profile_rpm);
     }
-    else if (!rev.depressed)
+    else
     {
       manual_rev_active = false;
     }
-    //make sure we haven't been revving for longer than the safety timeout and battery voltage is OK
+  
+    // ========== FIRE TRIGGER HANDLING ==========
     if (trig.depressed && !menu.depressed && safety_timer < REV_SAFETY_TIMEOUT && !low_batt) 
     {
-      rev_up();
+      // Spin up if not already spun up
+      if (!revved)
+      {
+        if (use_idle && presently_idling)
+        {
+          // Tournament mode: transition from idle to full speed
+          presently_idling = false;
+        }
+        set_target_rpm(profile_rpm);
+        
+        // Wait for spinup
+        unsigned long spinup_start = millis();
+        while (current_rpm_left <= (profile_rpm - SPINUP_RPM_THRESHOLD) || 
+               current_rpm_right <= (profile_rpm - SPINUP_RPM_THRESHOLD))
+        {
+          if (millis() - spinup_start > REV_FAIL_TIMER)
+          {
+            // Failed to spin up - abort
+            rev_down();
+            while (trig.depressed)
+            {
+              trig.Update();
+              delay(5);
+            }
+            break;
+          }
+          delayMicroseconds(100);
+        }
+        
+        // Check if we successfully spun up
+        if (millis() - spinup_start <= REV_FAIL_TIMER)
+        {
+          revved = true;
+          spin_down_timer = millis();
+          safety_timer = millis() - last_rev_timestamp;
+        }
+      }
+      else
+      {
+        // Already revved, update timers
+        spin_down_timer = millis();
+        safety_timer = millis() - last_rev_timestamp;
+      }
+      
+      // Fire according to mode
       if (revved) 
       {
         switch (mode) 
         {
           case SEMI:
           case BINARY:
-            //fire once then set flag that prevents additional shots until trigger is released
+            // Fire once then set flag that prevents additional shots until trigger is released
             if (!fired) 
             {
               fire();
@@ -274,18 +449,17 @@ void main_loop()
             }
             break;
           case AUTO:
-            trig.Update();
-            if (trig.depressed) 
-            {
-              fire();
-            }
+            // Full auto - fire continuously while trigger held
+            fire();
             break;
         }
       }
     } 
     else 
     {
-
+      // Fire trigger not pressed
+      
+      // Safety timeout check
       if (safety_timer >= REV_SAFETY_TIMEOUT)
       {
         rev_down();
@@ -296,54 +470,84 @@ void main_loop()
         }
       }
 
-      //if in binary or reverse mode, fire on trigger release
-      if (fired && revved) 
+      // Binary mode: fire on trigger release
+      if (fired && revved && mode == BINARY) 
       {
-        if (mode == BINARY) 
-        {
-          fire();
-        }
+        fire();
       }
+      
+      // Reset fired flag for next trigger pull
       fired = false;
-      if (millis() - spin_down_timer >= post_shot_rev_duration_ms && !manual_rev_active)
+      
+      // ========== SPINDOWN LOGIC ==========
+      // Keep wheels spun if:
+      // - Rev trigger is held, OR
+      // - Fire trigger is held, OR
+      // - Within post_shot_rev_duration_ms of last fire
+      bool should_stay_spun = manual_rev_active ||
+                             trig.depressed ||
+                             (millis() - last_fire_timestamp < post_shot_rev_duration_ms);
+      
+      if (!should_stay_spun)
       {
         rev_down();
       }
+      
       retractNoid();
     }
 
     //if trigger is held whilst menu is held, lock/unlock the fire mode
-    if (menu.depressed && trig.clicks < 0) {
+    if (menu.depressed && trig.clicks < 0) 
+    {
       update_display = true;
       lock = !lock;
       menu.clicks = 0;
       trig.clicks = 0;
     }
 
-    //update battery voltage reading every BATTFREQ milliseconds
+    //update battery voltage reading every BATTERY_CHECK_MS milliseconds
     //only when not revving to prevent low readings due to sag
-    if (millis() % BATTERY_CHECK_MS == 0 && !revved) {
-      update_display = true;
+    if (millis() % BATTERY_CHECK_MS == 0 && !revved) 
+    {
       check_battery();
-      single_shot_delay = map(voltage, 17, 15, 17, 26);
+      if (voltage < LOW_BATTERY_THRESHOLD)
+      {
+        low_batt = true;
+      }
+      else
+      {
+        low_batt = false;
+      }
+      noid_extend_ms = map(voltage, 17.0, 14.6, 20, 30);
+    }
+
+    if (millis() % SCREEN_UPDATE_MS == 0)
+    {
+      update_display = true;
     }
 
     //write the display buffer if flag is set & only when not revving
     //prevents screen write delay from affecting operation
-    if (update_display && !revved) {
+    if (update_display && !revved)
+    {
       display_main();
       update_display = false;
     }
-  } else {
+  } 
+  else 
+  {
     //settings menu
     //update screen every second for runtime display
-    if (millis() % 1000 == 0) {
+    if (millis() % 1000 == 0) 
+    {
       update_display = true;
     }
 
     //menu press switches selected parameter
-    if (menu.clicks > 0) {
-      if (trig.depressed) {
+    if (menu.clicks > 0) 
+    {
+      if (trig.depressed)
+      {
         // Reset current profile to defaults
         Profile defaultProfile;
         memcpy_P(&defaultProfile, &DEFAULT_PROFILES[current_profile], sizeof(Profile));
@@ -366,11 +570,14 @@ void main_loop()
         update_display = true;
         menu.clicks = 0;  // Clear the click so it doesn't change selection
         trig.clicks = 0;
-      } else {
+      }
+      else 
+      {
         update_display = true;
         selected++;
 
-        if (selected > 3) {
+        if (selected > 5) 
+        {
           selected = 1;
         }
         menu.clicks = 0;
@@ -379,114 +586,195 @@ void main_loop()
     }
 
     //trigger press changes parameter value
-    if (trig.clicks > 0) {
+    if (trig.clicks > 0)
+    {
       update_display = true;
-      switch (selected) {
+      switch (selected)
+      {
         case 1:
           profile_rpm += RPM_STEP_SIZE;
-          if (profile_rpm > MAX_RPM) {
+          if (profile_rpm > MAX_RPM)
+          {
             profile_rpm = MIN_RPM;
           }
           break;
         case 2:
           fire_rate += 1;
-          if (fire_rate > MAX_FIRE_RATE) {
+          if (fire_rate > MAX_FIRE_RATE)
+          {
             fire_rate = MIN_FIRE_RATE;
           }
           single_shot_delay = ceil((1000 - (fire_rate * noid_extend_ms)) / fire_rate);
           break;
         case 3:
           post_shot_rev_duration_ms += 100;
-          if (post_shot_rev_duration_ms > 2000) {
-            post_shot_rev_duration_ms = 0;
+          if (post_shot_rev_duration_ms > MAX_POST_SHOT_REV_MS)
+          {
+            post_shot_rev_duration_ms = MIN_POST_SHOT_REV_MS;
           }
+          break;
+        case 4:
+          use_idle = !use_idle;
+          break;
+        case 5:
+          // Save current profile to filesystem
+          save_requested = true;
+          bool done = false;
+          while (!done)
+          {
+            mutex_enter_blocking(&save_mutex);
+            if (!save_requested) done = true;
+            mutex_exit(&save_mutex);
+            delay(10);
+          }
+          // Visual feedback
+          oled.clearDisplay();
+          oled.setCursor(0, 28);
+          oled.print(F("Profile Saved!"));
+          oled.display();
+          delay(1000);  // Show message briefly
           break;
       }
       menu.clicks = 0;
       trig.clicks = 0;
     }
 
+    
     //rev press changes parameter value the other way
-    if (rev.clicks > 0) {
+    if (rev.clicks > 0)
+    {
       update_display = true;
-      switch (selected) {
+      switch (selected)
+      {
         case 1:
           profile_rpm -= RPM_STEP_SIZE;
-          if (profile_rpm < MIN_RPM) {
+          if (profile_rpm < MIN_RPM)
+          {
             profile_rpm = MAX_RPM;
           }
           break;
         case 2:
           fire_rate -= 1;
-          if (fire_rate < MIN_FIRE_RATE) {
+          if (fire_rate < MIN_FIRE_RATE)
+          {
             fire_rate = MAX_FIRE_RATE;
           }
           single_shot_delay = ceil((1000 - (fire_rate * noid_extend_ms)) / fire_rate);
           break;
         case 3:
           post_shot_rev_duration_ms -= 100;
-          if (post_shot_rev_duration_ms < 0) {
-            post_shot_rev_duration_ms = 2000;
+          if (post_shot_rev_duration_ms < MIN_POST_SHOT_REV_MS)
+          {
+            post_shot_rev_duration_ms = MAX_POST_SHOT_REV_MS;
           }
+          break;
+        case 4:
+          use_idle = !use_idle;
           break;
       }
       menu.clicks = 0;
       trig.clicks = 0;
       rev.clicks = 0;
     }
+
+    // hold rev or trigger to rapidly change RPM setting
+    if (rev.clicks < 0 && selected == 1)
+    {
+      while (rev.depressed)
+      {
+        profile_rpm -= RPM_STEP_SIZE;
+        if (profile_rpm < MIN_RPM)
+        {
+          profile_rpm = MAX_RPM;
+        }
+        rev.Update();
+        display_settings(selected);
+        delay(30);
+      }
+    }
+
+    if (trig.clicks < 0 && selected == 1)
+    {
+      while (trig.depressed)
+      {
+        profile_rpm += RPM_STEP_SIZE;
+        if (profile_rpm > MAX_RPM)
+        {
+          profile_rpm = MIN_RPM;
+        }
+        trig.Update();
+        display_settings(selected);
+        delay(30);
+      }
+    }
     retractNoid();
     shot_count = 0;
 
-    if (update_display) {
+    if (update_display)
+    {
       display_settings(selected);
       update_display = false;
     }
   }
 }
 
-void rev_up() {
-  //if in tourney mode and flywheel speed set to idle RPM, first update the targetRPM to the actual RPM
-  if (tourney && idle) {
-    idle = false;
-    staged_rpm = profile_rpm;
-    safe_set_target_rpm(staged_rpm);
+void rev_up() 
+{
+  // Transition from idle to full speed in tournament mode
+  if (use_idle && presently_idling) 
+  {
+    presently_idling = false;
+    set_target_rpm(profile_rpm);
   }
-  if (!revved) {
-    //Record trigger down event timestamp
-    long last_trigger_down_ms = millis();
+  
+  if (!revved) 
+  {
+    // Record trigger down event timestamp
+    unsigned long last_trigger_down_ms = millis();
 
-    //Wait for motors to reach speed
+    // Wait for motors to reach speed
     bool fail = false;
     
-    while (current_rpm_left <= (profile_rpm - SPINUP_RPM_THRESHOLD) || (current_rpm_right <= (profile_rpm - SPINUP_RPM_THRESHOLD))) {
-      if (millis() - last_trigger_down_ms > REV_FAIL_TIMER) {
+    while (current_rpm_left <= (profile_rpm - SPINUP_RPM_THRESHOLD) || 
+           current_rpm_right <= (profile_rpm - SPINUP_RPM_THRESHOLD)) 
+    {
+      if (millis() - last_trigger_down_ms > REV_FAIL_TIMER) 
+      {
         fail = true;
         break;
       }
       delayMicroseconds(100);
     }
-    if (fail) {
-      //Whoops. We exited because motors failed to reach speed setpoint in a reasonable time
-      //Shut down motors
+    
+    if (fail) 
+    {
+      // Failed to reach speed setpoint in time - shut down motors
       rev_down();
-      while (trig.depressed) {
+      while (trig.depressed) 
+      {
         trig.Update();
         delay(5);
       }
-    } else {
-      revved = true;  //say it's ready to fire, close everything out so it'll go to the fire control code
+    } 
+    else 
+    {
+      // Successfully spun up
+      revved = true;
       spin_down_timer = millis();
       safety_timer = millis() - last_rev_timestamp;
     }
-
-  } else {
+  } 
+  else 
+  {
+    // Already revved, just update timers
     spin_down_timer = millis();
     safety_timer = millis() - last_rev_timestamp;
   }
 }
 
 //main (firing) screen display output
-void display_main() {
+void display_main()
+{
   byte rpm_thousands = profile_rpm / 1000;
   byte rpm_hundreds = (profile_rpm % 1000) / 100;
   byte countH = 60;
@@ -496,6 +784,17 @@ void display_main() {
   oled.print(noid_extend_ms);
   oled.print("ms");
 
+  oled.drawFastHLine(55, 1, 23, 1);
+  oled.drawFastHLine(55, 7, 23, 1);
+  oled.drawFastVLine(54, 2, 5, 1);
+  oled.drawFastVLine(78, 2, 5, 1);
+  oled.drawFastVLine(79, 3, 2, 1);
+  int battery_ticks = min(10, (int)((voltage - 14.8) / 0.2));
+  for (int b = 0; b < battery_ticks; b++)
+  {
+    oled.drawFastVLine(57 + (b * 2), 3, 2, 1);
+  }
+
   oled.setCursor(99, 0);
   oled.print(voltage, 1);
   oled.print(F("V"));
@@ -503,41 +802,43 @@ void display_main() {
 
   if (!low_batt) {
     oled.setFont(&FreeSansBoldOblique24pt7b);
-
     countH = 50;
-    if (shot_count > 999) {
-      shot_count = 0;
-    }
-    if (shot_count > 9) {
-      countH -= 14;
-    }
-    if (shot_count > 99) {
-      countH -= 14;
-    }
+    if (shot_count > 999) shot_count = 0;
+    if (shot_count > 9) countH -= 14;
+    if (shot_count > 99) countH -= 14;
     oled.setCursor(countH, 47);
     oled.print(shot_count);
-  } else {
+  } 
+  else
+  {
     oled.setCursor(0, 26);
     oled.print(F("BATTERY\n CRITICAL!"));
   }
 
-  countH = 105;
+  countH = 80;
   oled.setFont();
   oled.drawFastHLine(0, 53, 128, 1);
-  if (low_batt) {
+  int throttle_thousands = profile_rpm / 1000;
+  int throttle_hundreds = (profile_rpm % 1000) / 100;
+  if (low_batt) 
+  {
     throttle_thousands = 0;
   }
-  if (throttle_thousands > 9) {
+  if (throttle_thousands > 9)
+  {
     countH -= 6;
   }
   oled.setCursor(countH, 56);
   oled.print(throttle_thousands);
   oled.print(F("."));
   oled.print(throttle_hundreds);
+  oled.print(F("K RPM"));
   oled.setCursor(0, 56);
 
-  if (!low_batt) {
-    switch (mode) {
+  if (!low_batt)
+  {
+    switch (mode)
+    {
       case SEMI:
         oled.print(F("Semi"));
         break;
@@ -548,69 +849,58 @@ void display_main() {
         oled.print(F("Binary"));
         break;
     }
-    if (lock) {
+    if (lock)
+    {
       oled.print(F("*"));
     }
-  } else {
+  }
+  else
+  {
     oled.print(F("STOP"));
   }
-
   oled.display();
 }
 
 //settings screen display output
-void display_settings(byte selected) {
-  //run timer
-  unsigned int t = millis() / 1000;
-  byte hours = t / 3600;
-  t %= 3600;
-  byte minutes = t / 60;
-  t %= 60;
-  byte seconds = t;
-
+void display_settings(byte selected)
+{
   oled.clearDisplay();
   oled.setCursor(0, 0);
-  oled.print(F("0"));
-  oled.print(hours);
-  oled.print(F(":"));
-  if (minutes < 10) {
-    oled.print(F("0"));
-  }
-  oled.print(minutes);
-  oled.print(F(":"));
-  if (seconds < 10) {
-    oled.print(F("0"));
-  }
-  oled.print(seconds);
-  oled.drawFastHLine(0, 9, 128, 1);
-  oled.setCursor(0, 11);
   oled.print(F("RPM: "));
-  oled.setCursor(96, 11);
-  if (selected == 1) {
-    oled.setTextColor(0, 1);
-  }
+  oled.setCursor(96, 0);
+  if (selected == 1) oled.setTextColor(0, 1);
   oled.print(profile_rpm);
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 25);
+  oled.setCursor(0, 11);
   oled.print(F("Fire Rate: "));
-  oled.setCursor(96, 25);
-  if (selected == 2) {
-    oled.setTextColor(0, 1);
-  }
+  oled.setCursor(96, 11);
+  if (selected == 2) oled.setTextColor(0, 1);
   oled.print(fire_rate);
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 39);
-  oled.print(F("Post-fire rev (ms): "));
-  oled.setCursor(96, 39);
-  if (selected == 3) {
-    oled.setTextColor(0, 1);
-  }
+  oled.setCursor(0, 25);
+  oled.print(F("Post-fire rev: "));
+  oled.setCursor(96, 25);
+  if (selected == 3) oled.setTextColor(0, 1);
   oled.print(post_shot_rev_duration_ms);
+  oled.setTextColor(1, 0);
+  oled.setCursor(0, 39);
+  oled.print(F("Idle: "));
+  oled.setCursor(96, 39);
+  if (selected == 4) oled.setTextColor(0, 1);
+  if (use_idle) oled.print(F("Yes"));
+  else oled.print(F("No"));
+  oled.setTextColor(1, 0);
+  oled.setCursor(0, 53);
+  oled.print(F("Save Profile: "));
+  oled.setCursor(96, 53);
+  if (selected == 5) oled.setTextColor(0, 1);
+  oled.print(F("Save"));
   oled.setTextColor(1, 0);
   oled.display();
 }
 
-void core1_main() {
+void core1_main()
+{
   menu.debounceTime = 20;
   trig.debounceTime = 5;
   rev.debounceTime = 5;
@@ -619,10 +909,11 @@ void core1_main() {
   trig.multiclickTime = 0;
   menu.multiclickTime = 0;
   rev.multiclickTime = 0;
+  analogReadResolution(12);
   //startup animation
-  Wire.setSDA(PIN_OLED_SDA);
-  Wire.setSCL(PIN_OLED_SCL);
-  Wire.begin();
+  Wire1.setSDA(PIN_OLED_SDA);
+  Wire1.setSCL(PIN_OLED_SCL);
+  Wire1.begin();
   oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   oled.setCursor(0, 0);
   oled.setTextColor(1);
@@ -633,28 +924,52 @@ void core1_main() {
   oled.setCursor(8, 40);
   oled.display();
   String str;
-  if (digitalRead(PIN_MENU_IN) == LOW && digitalRead(PIN_FIRE_IN) == HIGH) {
-    current_profile = PROFILE_LOW;
-    str = "Low  Power";
-  } else if (digitalRead(PIN_MENU_IN) == HIGH && digitalRead(PIN_FIRE_IN) == LOW) {
-    current_profile = PROFILE_MED;
-    str = "Mid  Power";
-  } else if (digitalRead(PIN_MENU_IN) == LOW && digitalRead(PIN_FIRE_IN) == LOW) {
-    current_profile = PROFILE_T;
-    menu.longClickTime = 500;
-    str = "Tournament";
-    tourney = true;
-    idle = true;
-  } else {
-    str = "High Power";
-    current_profile = PROFILE_HIGH;
+  switch (current_profile) 
+  {
+    case PROFILE_LOW:
+      str = "Low  Power";
+      break;
+    case PROFILE_MED:
+      str = "Mid  Power";
+      break;
+    case PROFILE_T:
+      str = "Tournament";
+      break;
+    case PROFILE_HIGH:
+    default:
+      str = "High Power";
+      break;
   }
-
-  load_profile(current_profile);
+  if (digitalRead(PIN_REV_IN) == LOW)
+  {
+    oled.clearDisplay();
+    oled.setFont();
+    oled.setTextSize(1);
+    oled.setCursor(0, 20);
+    oled.print("Passthrough mode");
+    oled.setCursor(0, 50);
+    oled.print("Menu to reset");
+    oled.display();
+    
+    attachInterrupt(digitalPinToInterrupt(PIN_MENU_IN), reset, FALLING);
+    // Passthrough mode - don't initialize DSHOT motors
+      uint8_t pins[4] = {PIN_ESC_1_OUT, PIN_SOLENOID_OUT, PIN_ESC_2_OUT, PIN_UNUSED_ESC_OUT};
+      while(true)
+      {
+          beginPassthrough(pins, 4);
+          while (processPassthrough()) {}
+      }
+  } 
   oled.print(str);
   oled.display();
   oled.clearDisplay();
+  initialize_motors();
   noid_extend_ms = map(voltage, 17.0, 14.6, 17, 26);
+  if (use_idle)
+  {
+    set_target_rpm(IDLE_RPM);
+    presently_idling = true;
+  } 
   while (true) 
   {
     main_loop();
@@ -670,6 +985,13 @@ void loop()
         delay(100);
         return;
     }
+    mutex_enter_blocking(&save_mutex);
+    if (save_requested) 
+    {
+        save_current_profile(current_profile);
+        save_requested = false;
+    }
+    mutex_exit(&save_mutex);
     // Core 0's only job: send throttle to motors every 200us
     // Use mutex to safely access motors while Core 1 may be setting target RPM
     mutex_enter_blocking(&motor_mutex);
