@@ -16,12 +16,10 @@
 #include <stdio.h>
 #include <Wire.h>
 #include "FreeSansBoldOblique24pt7b.h"
-#include "hardware/pwm.h"
 #include "hardware/irq.h"
 #include "pico/multicore.h"
 #include "pico/mutex.h"
 #include "hardware/watchdog.h"
-#include "hardware/pwm.h"
 #include <stdint.h>
 #include <iostream>
 #include <string>
@@ -147,16 +145,18 @@ void save_current_profile(uint8_t profile_num)
   }
 }
 
-void set_solenoid_pwm(uint16_t throttle_us) 
+void set_solenoid_throttle(uint16_t throttle) 
 {
-    pwm_set_chan_level(slice_num, channel_num, throttle_us);
+  mutex_enter_blocking(&motor_mutex);
+  solenoid_throttle_target = throttle;
+  mutex_exit(&motor_mutex);
 }
 
 void extendNoid() 
 {
   if (USE_ESC_SOLENOID)
   {
-    set_solenoid_pwm(nextSolenoidOn);
+    set_solenoid_throttle(nextSolenoidOn);
     if (nextSolenoidOn == SOLENOID_ON_HIGH) 
     {
         nextSolenoidOn = SOLENOID_ON_LOW;
@@ -176,7 +176,7 @@ void retractNoid()
 {
   if (USE_ESC_SOLENOID)
   {
-    set_solenoid_pwm(SOLENOID_OFF);
+  set_solenoid_throttle(SOLENOID_OFF);
   }
   else
   {
@@ -264,20 +264,13 @@ void setup()
 // Initialize motors and solenoid (called from Core 1 after mode selection)
 void initialize_motors() 
 {
-    left_motor = new FlywheelMotor(PIN_ESC_1_OUT, MOTOR_POLES,  new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
-    right_motor = new FlywheelMotor(PIN_ESC_2_OUT, MOTOR_POLES, new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
-    // Initialize PWM for solenoid (high-frequency servo, 480Hz
-    gpio_set_function(PIN_SOLENOID_OUT, GPIO_FUNC_PWM);
-    slice_num = pwm_gpio_to_slice_num(PIN_SOLENOID_OUT);
-    channel_num = pwm_gpio_to_channel(PIN_SOLENOID_OUT);
-    
-    pwm_config config = pwm_get_default_config();
-    pwm_config_set_clkdiv(&config, PWM_CLOCK_DIV);
-    pwm_config_set_wrap(&config, PWM_WRAP);
-    pwm_init(slice_num, &config, true);
-    
-    // Set initial position to center (1500us)
-    pwm_set_chan_level(slice_num, channel_num, PWM_CENTER);
+  left_motor = new FlywheelMotor(PIN_ESC_1_OUT, MOTOR_POLES,  new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
+  right_motor = new FlywheelMotor(PIN_ESC_2_OUT, MOTOR_POLES, new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
+  if (USE_ESC_SOLENOID)
+  {
+    solenoid_dshot = new BidirDShotX1(PIN_SOLENOID_OUT, 600);
+    solenoid_dshot->sendThrottle(SOLENOID_OFF);
+  }
     // Enable extended telemetry on both motors
     for (int i = 0; i < 5000; i++) 
     {
@@ -518,7 +511,7 @@ void main_loop()
       {
         low_batt = false;
       }
-      noid_extend_ms = map(voltage, 17.0, 14.6, 20, 30);
+      noid_extend_ms = map(voltage, 17.0, 14.6, 16, 26);
     }
 
     if (millis() % SCREEN_UPDATE_MS == 0)
@@ -992,8 +985,8 @@ void loop()
         save_requested = false;
     }
     mutex_exit(&save_mutex);
-    // Core 0's only job: send throttle to motors every 200us
-    // Use mutex to safely access motors while Core 1 may be setting target RPM
+  // Core 0's only job: send throttle to motors every 200us
+  // Use mutex to safely access motors while Core 1 may be setting target RPM
     mutex_enter_blocking(&motor_mutex);
     if (left_motor != nullptr) 
     {
@@ -1005,6 +998,10 @@ void loop()
         right_motor->send_throttle();
         current_rpm_right = right_motor->get_current_rpm();
     }
+  if (solenoid_dshot != nullptr)
+  {
+    solenoid_dshot->sendThrottle(solenoid_throttle_target);
+  }
     mutex_exit(&motor_mutex);
     delayMicroseconds(200);
 }
