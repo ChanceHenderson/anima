@@ -239,7 +239,7 @@ void set_target_rpm(uint32_t rpm)
 void setup()
 {
     // Core 0 runs setup() by default on Arduino
-    Serial.begin(115200);
+    Serial.ignoreFlowControl(true);
     Serial.printf("Core 0: Starting setup on Core 0\n");
     // If all three buttons are held, format LittleFS
     if (digitalRead(PIN_MENU_IN) == LOW && digitalRead(PIN_FIRE_IN) == LOW && digitalRead(PIN_REV_IN) == LOW) {
@@ -1027,12 +1027,12 @@ void core1_main()
     
     attachInterrupt(digitalPinToInterrupt(PIN_MENU_IN), reset, FALLING);
     // Passthrough mode - don't initialize DSHOT motors
-      uint8_t pins[4] = {PIN_ESC_1_OUT, PIN_SOLENOID_OUT, PIN_ESC_2_OUT, PIN_UNUSED_ESC_OUT};
-      while(true)
-      {
-          beginPassthrough(pins, 4);
-          while (processPassthrough()) {}
-      }
+    uint8_t pins[4] = {PIN_ESC_1_OUT, PIN_SOLENOID_OUT, PIN_ESC_2_OUT, PIN_UNUSED_ESC_OUT};
+    while(true)
+    {
+        beginPassthrough(pins, 4);
+        while (processPassthrough()) {}
+    }
   } 
   oled.print(str);
   oled.display();
