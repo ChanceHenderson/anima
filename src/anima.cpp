@@ -10,7 +10,6 @@
 #include <Adafruit_SSD1306.h>
 #include <bits/stdc++.h>
 #include <ClickButton.h>
-//#include <EEPROM.h>
 #include <PIO_DShot.h>
 #include <Servo.h>
 #include <stdio.h>
@@ -26,6 +25,7 @@
 #include <sstream>
 #include "flywheelmotor.h"
 #include "pidcontrol.h"
+#include "basicpwmcontrol.h"
 #include "esc_passthrough.h"
 
 // Mutex for safe motor access between cores
@@ -70,6 +70,7 @@ void load_profile(uint8_t profile_num)
             fire_rate = loaded_profile.fire_rate;
             post_shot_rev_duration_ms = loaded_profile.post_shot_rev_ms;
             use_idle = loaded_profile.use_idle;
+            rev_is_auto = loaded_profile.rev_is_auto;
             return;
           }
           else
@@ -102,6 +103,7 @@ void load_profile(uint8_t profile_num)
   fire_rate = loaded_profile.fire_rate;
   post_shot_rev_duration_ms = loaded_profile.post_shot_rev_ms;
   use_idle = loaded_profile.use_idle;
+  rev_is_auto = loaded_profile.rev_is_auto;
 }
 
 void check_battery()
@@ -124,7 +126,8 @@ void save_current_profile(uint8_t profile_num)
     profile_rpm,
     fire_rate,
     post_shot_rev_duration_ms,
-    use_idle
+    use_idle,
+    rev_is_auto
   };
   
   if (LittleFS.begin())
@@ -199,7 +202,7 @@ void reset()
     while(1); // Wait for watchdog to trigger reset
 }
 
-void fire()
+void fire(bool rev_trigger_auto)
 {
     fireNoid();
     last_fire_timestamp = millis();
@@ -207,11 +210,11 @@ void fire()
     update_display = true;
     
     // Apply fire rate delay (only for non-full-auto modes)
-    if (mode == SEMI || mode == BINARY)
+    if (!rev_trigger_auto && (mode == SEMI || mode == BINARY))
     {
         delay(MAX_ROF_DELAY);
     }
-    else if (mode == AUTO)
+    else if (rev_trigger_auto || mode == AUTO)
     {
         delay(single_shot_delay);
     }
@@ -238,6 +241,10 @@ void setup()
     // Core 0 runs setup() by default on Arduino
     Serial.begin(115200);
     Serial.printf("Core 0: Starting setup on Core 0\n");
+    // If all three buttons are held, format LittleFS
+    if (digitalRead(PIN_MENU_IN) == LOW && digitalRead(PIN_FIRE_IN) == LOW && digitalRead(PIN_REV_IN) == LOW) {
+        impending_format = true;
+    }
     if (digitalRead(PIN_MENU_IN) == LOW && digitalRead(PIN_FIRE_IN) == HIGH)
     {
       current_profile = PROFILE_LOW;
@@ -365,7 +372,7 @@ void main_loop()
   {
     // ========== REV TRIGGER HANDLING ==========
     // Rev trigger held: spin up to profile RPM
-    if (rev.depressed && !menu.depressed && !low_batt)
+    if (!rev_is_auto && rev.depressed && !menu.depressed && !low_batt)
     {
       manual_rev_active = true;
       if (use_idle && presently_idling)
@@ -379,9 +386,9 @@ void main_loop()
     {
       manual_rev_active = false;
     }
-  
+    
     // ========== FIRE TRIGGER HANDLING ==========
-    if (trig.depressed && !menu.depressed && safety_timer < REV_SAFETY_TIMEOUT && !low_batt) 
+    if (((rev_is_auto && rev.depressed) || trig.depressed) && !menu.depressed && safety_timer < REV_SAFETY_TIMEOUT && !low_batt) 
     {
       // Spin up if not already spun up
       if (!revved)
@@ -430,21 +437,29 @@ void main_loop()
       // Fire according to mode
       if (revved) 
       {
-        switch (mode) 
+        if (rev_is_auto && rev.depressed)
         {
-          case SEMI:
-          case BINARY:
-            // Fire once then set flag that prevents additional shots until trigger is released
-            if (!fired) 
-            {
-              fire();
-              fired = true;
-            }
-            break;
-          case AUTO:
-            // Full auto - fire continuously while trigger held
-            fire();
-            break;
+          // If rev trigger is also fire trigger, fire continuously while held
+          fire(true);
+        }
+        else
+        {
+          switch (mode) 
+          {
+            case SEMI:
+            case BINARY:
+              // Fire once then set flag that prevents additional shots until trigger is released
+              if (!fired) 
+              {
+                fire(false);
+                fired = true;
+              }
+              break;
+            case AUTO:
+              // Full auto - fire continuously while trigger held
+              fire(false);
+              break;
+          }
         }
       }
     } 
@@ -466,7 +481,7 @@ void main_loop()
       // Binary mode: fire on trigger release
       if (fired && revved && mode == BINARY) 
       {
-        fire();
+        fire(false);
       }
       
       // Reset fired flag for next trigger pull
@@ -569,7 +584,7 @@ void main_loop()
         update_display = true;
         selected++;
 
-        if (selected > 5) 
+        if (selected > 6) 
         {
           selected = 1;
         }
@@ -597,7 +612,7 @@ void main_loop()
           {
             fire_rate = MIN_FIRE_RATE;
           }
-          single_shot_delay = ceil((1000 - (fire_rate * noid_extend_ms)) / fire_rate);
+          single_shot_delay = max(ceil((1000/fire_rate) - (noid_extend_ms+noid_retract_ms)), 0);
           break;
         case 3:
           post_shot_rev_duration_ms += 100;
@@ -610,6 +625,9 @@ void main_loop()
           use_idle = !use_idle;
           break;
         case 5:
+          rev_is_auto = !rev_is_auto;
+          break;
+        case 6:
           // Save current profile to filesystem
           save_requested = true;
           bool done = false;
@@ -652,7 +670,7 @@ void main_loop()
           {
             fire_rate = MAX_FIRE_RATE;
           }
-          single_shot_delay = ceil((1000 - (fire_rate * noid_extend_ms)) / fire_rate);
+          single_shot_delay = max(ceil((1000/fire_rate) - (noid_extend_ms+noid_retract_ms)), 0);
           break;
         case 3:
           post_shot_rev_duration_ms -= 100;
@@ -663,6 +681,9 @@ void main_loop()
           break;
         case 4:
           use_idle = !use_idle;
+          break;
+        case 5:
+          rev_is_auto = !rev_is_auto;
           break;
       }
       menu.clicks = 0;
@@ -870,23 +891,30 @@ void display_settings(byte selected)
   if (selected == 2) oled.setTextColor(0, 1);
   oled.print(fire_rate);
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 25);
+  oled.setCursor(0, 22);
   oled.print(F("Post-fire rev: "));
-  oled.setCursor(96, 25);
+  oled.setCursor(96, 22);
   if (selected == 3) oled.setTextColor(0, 1);
   oled.print(post_shot_rev_duration_ms);
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 39);
+  oled.setCursor(0, 33);
   oled.print(F("Idle: "));
-  oled.setCursor(96, 39);
+  oled.setCursor(96, 33);
   if (selected == 4) oled.setTextColor(0, 1);
   if (use_idle) oled.print(F("Yes"));
   else oled.print(F("No"));
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 53);
-  oled.print(F("Save Profile: "));
-  oled.setCursor(96, 53);
+  oled.setCursor(0, 44);
+  oled.print(F("Rev trigger auto: "));
+  oled.setCursor(96, 44);
   if (selected == 5) oled.setTextColor(0, 1);
+  if (rev_is_auto) oled.print(F("Yes"));
+  else oled.print(F("No"));
+  oled.setTextColor(1, 0);
+  oled.setCursor(0, 55);
+  oled.print(F("Save Profile: "));
+  oled.setCursor(96, 55);
+  if (selected == 6) oled.setTextColor(0, 1);
   oled.print(F("Save"));
   oled.setTextColor(1, 0);
   oled.display();
@@ -894,6 +922,11 @@ void display_settings(byte selected)
 
 void core1_main()
 {
+  if (!USE_ESC_SOLENOID)
+  {
+    pinMode(PIN_SOLENOID_MOSFET, OUTPUT);
+    digitalWrite(PIN_SOLENOID_MOSFET, LOW);
+  }
   menu.debounceTime = 20;
   trig.debounceTime = 5;
   rev.debounceTime = 5;
@@ -908,10 +941,58 @@ void core1_main()
   Wire1.setSCL(PIN_OLED_SCL);
   Wire1.begin();
   oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  oled.setCursor(0, 0);
   oled.setTextColor(1);
-  oled.setTextSize(2);
   oled.setTextWrap(false);
+  if (impending_format) 
+  {
+    oled.setTextSize(1);
+    oled.clearDisplay();
+    oled.setCursor(0, 12);
+    oled.print(F("All triggers held"));
+    oled.setCursor(0, 26);
+    oled.print(F("Profiles will reset"));
+    oled.setCursor(0, 40);
+    oled.print(F("in 5 seconds!"));
+    oled.setCursor(0, 54);
+    oled.print(F("Turn off now to stop."));
+    oled.display();
+    delay(5000);
+    // Signal core 0 to perform the format. Use volatile flag for cross-core sync.
+    mutex_enter_blocking(&save_mutex);
+    format_requested = true;
+    mutex_exit(&save_mutex);
+    // Wait for core 0 to clear the flag. Poll without taking the mutex to avoid deadlock
+    while (format_requested)
+    {
+      delay(100);
+    }
+    if (format_successful == 1)
+    {
+      // Visual feedback for format
+      oled.clearDisplay();
+      oled.setCursor(0, 24);
+      oled.print(F("Defaults Restored!"));
+      oled.setCursor(0, 38);
+      oled.print(F("Rebooting...."));
+      oled.display();
+      delay(5000);
+      reset(); 
+    }
+    else if (format_successful == 2)
+    {
+      oled.clearDisplay();
+      oled.setCursor(0, 24);
+      oled.print(F("Format failed!"));
+      oled.setCursor(0, 38);
+      oled.print(F("Rebooting...."));
+      oled.display();
+      delay(5000);
+      reset(); 
+    }
+    
+  }
+  oled.setTextSize(2);
+  oled.setCursor(0, 0);
   oled.clearDisplay();
   oled.drawBitmap(0, 0, splash, 128, 64, 1);
   oled.setCursor(8, 40);
@@ -973,18 +1054,33 @@ void core1_main()
 // Core 0 loop - continuously send motor throttle commands
 void loop()
 {
-    if (!motors_initialized) 
-    {
-        delay(100);
-        return;
-    }
+    // Allow formatting/save requests to be handled even before motors are initialized
     mutex_enter_blocking(&save_mutex);
     if (save_requested) 
     {
         save_current_profile(current_profile);
         save_requested = false;
     }
+    if (format_requested)
+    {
+      if (LittleFS.begin())
+      {
+        LittleFS.format();
+        LittleFS.end();
+        format_successful = 1;
+      }
+      else
+      {
+        format_successful = 2;
+      }
+      format_requested = false;
+    }
     mutex_exit(&save_mutex);
+    if (!motors_initialized) 
+    {
+        delay(100);
+        return;
+    }
   // Core 0's only job: send throttle to motors every 200us
   // Use mutex to safely access motors while Core 1 may be setting target RPM
     mutex_enter_blocking(&motor_mutex);
@@ -1004,4 +1100,160 @@ void loop()
   }
     mutex_exit(&motor_mutex);
     delayMicroseconds(200);
+}
+
+void tune_feed_forward() 
+{
+  motors_initialized = false; // Pause motor loop while swapping algorithms
+  delayMicroseconds(500); // Ensure motor loop is paused
+  FlywheelControlAlgorithm* ff_algo_left = left_motor->control_algorithm;
+  FlywheelControlAlgorithm* ff_algo_right = right_motor->control_algorithm;
+  left_motor->control_algorithm = new BasicPWMControl(0);
+  right_motor->control_algorithm = new BasicPWMControl(0);
+  motors_initialized = true; // Resume motor loop with new algorithms
+
+  int throttle_rpms[9] = {0,0,0,0,0,0,0,0,0};
+  for (int i = 1; i < 10; i++) 
+  {
+    oled.clearDisplay();
+    oled.setFont();
+    oled.setTextSize(1);
+    oled.setCursor(0, 5);
+    oled.print("Feed forward tuning");
+    oled.setCursor(0, 20);
+    oled.print("Step 1: RPM test");
+    oled.setCursor(0, 35);
+    oled.print("Phase ");
+    oled.print(i);
+    oled.print("/9");
+    oled.setCursor(0, 50);
+    oled.print("Press trigger to start");
+    oled.display();
+    
+    while (digitalRead(PIN_FIRE_IN) == HIGH)
+    {
+        delay(10);
+    }
+
+    oled.clearDisplay();
+    oled.setFont();
+    oled.setTextSize(1);
+    oled.setCursor(30, 20);
+    oled.print("Throttle: ");
+    oled.print(i * 200);
+    oled.setCursor(0, 40);
+    oled.print("TEST IN PROGRESS!");
+    oled.display();
+
+    mutex_enter_blocking(&motor_mutex);
+    left_motor->control_algorithm->set_throttle(i * 200);
+    mutex_exit(&motor_mutex);
+
+    delay(1500); // Wait for motor to stabilize
+    uint32_t rpm_sum = 0;
+    for (int j = 0; j < 50; j++) 
+    {
+      rpm_sum += current_rpm_left;
+      delayMicroseconds(200);
+    }
+
+    mutex_enter_blocking(&motor_mutex);
+    left_motor->control_algorithm->set_throttle(0);
+    mutex_exit(&motor_mutex);
+
+    throttle_rpms[i-1] = rpm_sum / 50;
+  }
+  
+  oled.clearDisplay();
+  oled.setFont();
+  oled.setTextSize(1);
+  oled.setCursor(20, 0);
+  oled.print("Test Complete!");
+  oled.setCursor(0, 12);
+  oled.print("200: ");
+  oled.print(throttle_rpms[0]);
+  oled.setCursor(64, 12);
+  oled.print("400: ");
+  oled.print(throttle_rpms[1]);
+  oled.setCursor(0, 24);
+  oled.print("600: ");
+  oled.print(throttle_rpms[2]);
+  oled.setCursor(64, 24);
+  oled.print("800: ");
+  oled.print(throttle_rpms[3]);
+  oled.setCursor(0, 36);
+  oled.print("1000: "); 
+  oled.print(throttle_rpms[4]);
+  oled.setCursor(64, 36);
+  oled.print("1200: ");
+  oled.print(throttle_rpms[5]);
+  oled.setCursor(0, 48);
+  oled.print("1400: ");
+  oled.print(throttle_rpms[6]);
+  oled.setCursor(64, 48);
+  oled.print("1600: ");
+  oled.print(throttle_rpms[7]);
+  oled.setCursor(0, 60);
+  oled.print("1800: ");
+  oled.print(throttle_rpms[8]);
+  oled.setCursor(64, 60);
+  oled.print("Trigger...");
+  oled.display();
+
+  while (digitalRead(PIN_FIRE_IN) == HIGH)
+  {
+      delay(10);
+  }
+
+  int x[9] = {200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800};
+  std::pair<double, double> log_params = fitLog(x, throttle_rpms, 9);
+
+  oled.clearDisplay();
+  oled.setFont();
+  oled.setTextSize(1);
+  oled.setCursor(10, 0);
+  oled.print("Tuning complete!");
+  oled.setCursor(0, 12);
+  oled.print("Estimated curve: ");
+  oled.setCursor(0, 24);
+  oled.print("R=");
+  oled.print(int(log_params.second));
+  oled.print("ln(T)+");
+  oled.print(int(log_params.first));
+  oled.display();
+
+  motors_initialized = false; // Pause motor loop while swapping algorithms
+  delayMicroseconds(500); // Ensure motor loop is paused
+  delete left_motor->control_algorithm;
+  delete right_motor->control_algorithm;
+  left_motor->control_algorithm = ff_algo_left;
+  right_motor->control_algorithm = ff_algo_right;
+  motors_initialized = true; // Resume motor loop with new algorithms
+}
+
+std::pair<double,double> fitLog(
+    const int *x,
+    const int *y,
+    int n)
+{
+    double sumU = 0.0;
+    double sumY = 0.0;
+    double sumUU = 0.0;
+    double sumUY = 0.0;
+
+    for (int i = 0; i < n; ++i)
+    {
+        double u = std::log(x[i]);   // natural log
+        sumU  += u;
+        sumY  += y[i];
+        sumUU += u * u;
+        sumUY += u * y[i];
+    }
+
+    double denom = n * sumUU - sumU * sumU;
+
+    double a = (n * sumUY - sumU * sumY) / denom;
+    double b = (sumY - a * sumU) / n;
+
+    return {a, b};
 }

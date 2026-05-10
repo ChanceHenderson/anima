@@ -15,6 +15,7 @@ const byte MOTOR_POLES = 14;
 // Connect OLED to the 4-pin header on the side of the board
 // Connect the trigger pack to the 4-pin header in the center of the board
 // If you're using a mosfet board, connect the gate to the 2-pin header labeled "18" (and G)
+// If you're using a Trifolium board with the MOSFET built in, set the PIN_SOLENOID_MOSFET below appropriately and set USE_ESC_SOLENOID to false
 #define PIN_OLED_SDA 14
 #define PIN_OLED_SCL 15
 #define PIN_FIRE_IN 8
@@ -29,7 +30,7 @@ const byte MOTOR_POLES = 14;
 #define PIN_VOLTAGE_IN 28
 #define AVERAGE_WINDOW 200
 
-#define PIN_SOLENOID_MOSFET 18      // if USE_ESC_SOLENOID is false, use this pin for your mosfet gate
+#define PIN_SOLENOID_MOSFET 18      // if USE_ESC_SOLENOID is false, use this pin for your mosfet gate. On trifolium 1.1, it's 27. On 1.2, it's 24
 const bool USE_ESC_SOLENOID = true; // set to false if you're using a mosfet board
 
 ClickButton trig(PIN_FIRE_IN, LOW, CLICKBTN_PULLUP);  //trigger button
@@ -54,14 +55,15 @@ typedef struct
     uint8_t fire_rate;
     uint32_t post_shot_rev_ms;
     bool use_idle;
+	bool rev_is_auto;
 } Profile;
 
 const Profile DEFAULT_PROFILES[4] PROGMEM =
 {
-  { LOW_POWER, 8, 500, false },    // Low
-  { MID_POWER, 10, 500, false },   // Medium
-  { HIGH_POWER, 15, 500, false },  // High
-  { HIGH_POWER, 15, 500, false }   // Tournament
+  { LOW_POWER, 8, 500, false, false },    // Low
+  { MID_POWER, 10, 500, false, false },   // Medium
+  { HIGH_POWER, 15, 500, false, false },  // High
+  { HIGH_POWER, 15, 500, false, false }   // Tournament
 };
 
 const char* PROFILE_PATHS[4] =
@@ -79,6 +81,7 @@ byte current_profile = PROFILE_HIGH;
 unsigned int profile_rpm = HIGH_POWER;                                             //target RPM value
 byte fire_rate = 15;                                                               //target fire rate (darts per second)
 bool use_idle = false;                                                             // should motors idle between shots                   
+bool rev_is_auto = false;                                                          // should holding the rev trigger fire in full auto instead of revving?	
 unsigned int post_shot_rev_duration_ms = 500;                                      //how long to wait before powering off flywheels after firing
 
 // Used for settings screen
@@ -122,6 +125,11 @@ bool update_display = true;             //when true, write display buffer to scr
 byte selected = 1;                //menu selection
 bool settings = false;            //in settings mode?
 
+// LittleFS formatting stuff
+bool impending_format = false;    //has the user requested a file system reset?
+volatile bool format_requested = false;    //for cross-core communication
+volatile int format_successful = 0;       //result of formatting. 0: not tried, 1: success, 2: fail
+
 // Firing control stuff
 bool presently_idling = false;    //flywheels pre-rev/idle? (tournament mode)
 bool manual_rev_active = false;   //user holding the rev trigger?
@@ -133,11 +141,11 @@ unsigned long safety_timer = 0;         //counts up while revving for safety shu
 bool revved = false;
 
 // PID constants and feedforward curve parameters
-const float Kp = .6;            // throttle per RPM
-const float Ki = 1.6;             // throttle / (RPM * s)
-const float Kd = 0.0003;          // throttle*s / RPM
-const float feed_forward_curve_offset = 56074.0f;   // the throttle/rpm curve for plus motors, robo spirit wheels, and a 4s battery
-const float feed_forward_curve_exponent = 12952.0f; // was measured to be *about* RPM = -56074 + 12952 ln(throttle)
+float Kp = .6;            // throttle per RPM
+float Ki = 1.6;             // throttle / (RPM * s)
+float Kd = 0.0003;          // throttle*s / RPM
+float feed_forward_curve_offset = 56074.0f;   // the throttle/rpm curve for plus motors, robo spirit wheels, and a 4s battery
+float feed_forward_curve_exponent = 12952.0f; // was measured to be *about* RPM = -56074 + 12952 ln(throttle)
 
 // Motor stuff
 FlywheelMotor *left_motor;
@@ -170,12 +178,19 @@ volatile uint16_t solenoid_throttle_target = SOLENOID_OFF;
 BidirDShotX1 *solenoid_dshot = nullptr;
 
 // Solenoid control functions
-void fire();
+void fire(bool rev_trigger_auto = false); // fire the solenoid, with an option to allow the rev trigger to also fire
 void set_solenoid_throttle(uint16_t throttle);
 void extendNoid();
 void retractNoid();
 void fireNoid();
 /* END SOLENOID STUFF */
+
+
+// Tuning
+void tune_feed_forward();
+void load_feed_forward_constants();
+void save_feed_forward_constants();
+std::pair<double,double> fitLog(const int *x, const int *y, int n);
 
 void main_loop();
 
