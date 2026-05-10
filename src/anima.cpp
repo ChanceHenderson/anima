@@ -271,8 +271,8 @@ void setup()
 // Initialize motors and solenoid (called from Core 1 after mode selection)
 void initialize_motors() 
 {
-  left_motor = new FlywheelMotor(PIN_ESC_1_OUT, MOTOR_POLES,  new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
-  right_motor = new FlywheelMotor(PIN_ESC_2_OUT, MOTOR_POLES, new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
+  left_motor = new FlywheelMotor(PIN_LEFT_MOTOR, MOTOR_POLES,  new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
+  right_motor = new FlywheelMotor(PIN_RIGHT_MOTOR, MOTOR_POLES, new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
   if (USE_ESC_SOLENOID)
   {
     solenoid_dshot = new BidirDShotX1(PIN_SOLENOID_OUT, 600);
@@ -1027,7 +1027,7 @@ void core1_main()
     
     attachInterrupt(digitalPinToInterrupt(PIN_MENU_IN), reset, FALLING);
     // Passthrough mode - don't initialize DSHOT motors
-    uint8_t pins[4] = {PIN_ESC_1_OUT, PIN_SOLENOID_OUT, PIN_ESC_2_OUT, PIN_UNUSED_ESC_OUT};
+    uint8_t pins[4] = {PIN_ESC_CHANNEL_1, PIN_ESC_CHANNEL_2, PIN_ESC_CHANNEL_3, PIN_ESC_CHANNEL_4};
     while(true)
     {
         beginPassthrough(pins, 4);

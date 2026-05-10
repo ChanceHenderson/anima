@@ -8,30 +8,56 @@
 #include <LittleFS.h>
 #include "flywheelmotor.h"
 
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////// This is the start of the part you'll likely need to mess with //////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+
 // Plus motors have 14 poles. Change this if you're using different motors.
 const byte MOTOR_POLES = 14;
 // Currently set up for the Trifolium board
 // Connect 8-pin connector between Trifolium and ESC
 // Connect OLED to the 4-pin header on the side of the board
 // Connect the trigger pack to the 4-pin header in the center of the board
-// If you're using a mosfet board, connect the gate to the 2-pin header labeled "18" (and G)
 // If you're using a Trifolium board with the MOSFET built in, set the PIN_SOLENOID_MOSFET below appropriately and set USE_ESC_SOLENOID to false
+// OLED screen pins (the 4-pin header by the edge of the board)
 #define PIN_OLED_SDA 14
 #define PIN_OLED_SCL 15
+// Trigger pack pins (the 4-pin header in the center of the board)
 #define PIN_FIRE_IN 8
-#define PIN_REV_IN 10
+#define PIN_REV_IN  10
 #define PIN_MENU_IN 9
-#define PIN_ESC_1_OUT 0
-#define PIN_ESC_2_OUT 2
-#define PIN_SOLENOID_OUT 1
-#define PIN_UNUSED_ESC_OUT 3
+// These four are the GPIO ports that the ESC channels are connected to
+// They do not handle mapping of which channel does what function - that's handled in the logical pin definitions below
+// These four need to be correct for the passthrough to function appropriately
+#define PIN_ESC_CHANNEL_1 0
+#define PIN_ESC_CHANNEL_2 1
+#define PIN_ESC_CHANNEL_3 2
+#define PIN_ESC_CHANNEL_4 3
+// These four are the logical pin definitions used in the code to refer to the motors and solenoid. This allows for easy remapping if you want to change which ESC channels do what.
+// For instance, if you're using ESC channels 2 and 4 for your motors, you would set PIN_LEFT_MOTOR to PIN_ESC_CHANNEL_2 and PIN_RIGHT_MOTOR to PIN_ESC_CHANNEL_4
+// and then set the solenoid to one of the remaining channels (or use a mosfet and set USE_ESC_SOLENOID to false)	
+#define PIN_LEFT_MOTOR     PIN_ESC_CHANNEL_1
+#define PIN_RIGHT_MOTOR    PIN_ESC_CHANNEL_3
+#define PIN_SOLENOID_OUT   PIN_ESC_CHANNEL_2
+#define PIN_UNUSED_ESC_OUT PIN_ESC_CHANNEL_4
+// These two come in from the ESC 8-pin header but we don't actually use them for anything
 #define PIN_ESC_CURRENT 4
 #define PIN_ESC_TELEMETRY 26
+// Voltage reading pin - built into Trifolium, no wire needed
 #define PIN_VOLTAGE_IN 28
-#define AVERAGE_WINDOW 200
 
+// Solenoid control stuff
+// If you're using a mosfet board, connect the gate to the 2-pin header labeled "18" (and G)
+const bool USE_ESC_SOLENOID = true; // set to true if you're using an ESC channel for the solenoid, false if you're using a mosfet board
 #define PIN_SOLENOID_MOSFET 18      // if USE_ESC_SOLENOID is false, use this pin for your mosfet gate. On trifolium 1.1, it's 27. On 1.2, it's 24
-const bool USE_ESC_SOLENOID = true; // set to false if you're using a mosfet board
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////// This is the end of the part you'll likely need to mess with //////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 
 ClickButton trig(PIN_FIRE_IN, LOW, CLICKBTN_PULLUP);  //trigger button
 ClickButton menu(PIN_MENU_IN, LOW, CLICKBTN_PULLUP);  //menu button
