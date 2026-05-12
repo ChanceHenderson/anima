@@ -193,7 +193,7 @@ void rev_down();
 uint8_t noid_extend_ms = 16; // power pulse time for solenoid - this is dynamic based on voltage
 const uint8_t noid_retract_ms = 30; // time to wait after retracting solenoid before next action
 volatile byte MAX_ROF_DELAY = ceil((1000 - (MAX_FIRE_RATE * noid_extend_ms)) / MAX_FIRE_RATE);
-byte single_shot_delay = ceil((1000 - (fire_rate * noid_extend_ms)) / fire_rate);  //how long to wait after powering solenoid before it can be powered again
+byte single_shot_delay = max(ceil((1000/fire_rate) - (noid_extend_ms+noid_retract_ms)), 0);  //how long to wait after powering solenoid before it can be powered again
 
 // DSHOT throttle values for solenoid ESC
 const uint16_t SOLENOID_OFF = 0;       // Off
