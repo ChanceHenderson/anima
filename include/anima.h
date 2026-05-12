@@ -53,6 +53,9 @@ const byte MOTOR_POLES = 14;
 const bool USE_ESC_SOLENOID = true; // set to true if you're using an ESC channel for the solenoid, false if you're using a mosfet board
 #define PIN_SOLENOID_MOSFET 18      // if USE_ESC_SOLENOID is false, use this pin for your mosfet gate. On trifolium 1.1, it's 27. On 1.2, it's 24
 
+// Dual-stage trigger support. Anima doesn't need this, something like Fencer does
+// This shuts off the rev trigger in the menu screen since you can't press the trigger without pressing rev too
+const bool DUAL_STAGE_TRIGGER = false; // set to true if you have one trigger that presses two switches (half pull to rev, full pull to fire)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////// This is the end of the part you'll likely need to mess with //////////////////

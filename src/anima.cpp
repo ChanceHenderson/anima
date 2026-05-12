@@ -651,62 +651,64 @@ void main_loop()
     }
 
     
-    //rev press changes parameter value the other way
-    if (rev.clicks > 0)
+    if (!DUAL_STAGE_TRIGGER)
     {
-      update_display = true;
-      switch (selected)
+      //rev press changes parameter value the other way
+      if (rev.clicks > 0)
       {
-        case 1:
+        update_display = true;
+        switch (selected)
+        {
+          case 1:
+            profile_rpm -= RPM_STEP_SIZE;
+            if (profile_rpm < MIN_RPM)
+            {
+              profile_rpm = MAX_RPM;
+            }
+            break;
+          case 2:
+            fire_rate -= 1;
+            if (fire_rate < MIN_FIRE_RATE)
+            {
+              fire_rate = MAX_FIRE_RATE;
+            }
+            single_shot_delay = max(ceil((1000/fire_rate) - (noid_extend_ms+noid_retract_ms)), 0);
+            break;
+          case 3:
+            post_shot_rev_duration_ms -= 100;
+            if (post_shot_rev_duration_ms < MIN_POST_SHOT_REV_MS)
+            {
+              post_shot_rev_duration_ms = MAX_POST_SHOT_REV_MS;
+            }
+            break;
+          case 4:
+            use_idle = !use_idle;
+            break;
+          case 5:
+            rev_is_auto = !rev_is_auto;
+            break;
+        }
+        menu.clicks = 0;
+        trig.clicks = 0;
+        rev.clicks = 0;
+      }
+
+      // hold rev or trigger to rapidly change RPM setting
+      if (rev.clicks < 0 && selected == 1)
+      {
+        while (rev.depressed)
+        {
           profile_rpm -= RPM_STEP_SIZE;
           if (profile_rpm < MIN_RPM)
           {
             profile_rpm = MAX_RPM;
           }
-          break;
-        case 2:
-          fire_rate -= 1;
-          if (fire_rate < MIN_FIRE_RATE)
-          {
-            fire_rate = MAX_FIRE_RATE;
-          }
-          single_shot_delay = max(ceil((1000/fire_rate) - (noid_extend_ms+noid_retract_ms)), 0);
-          break;
-        case 3:
-          post_shot_rev_duration_ms -= 100;
-          if (post_shot_rev_duration_ms < MIN_POST_SHOT_REV_MS)
-          {
-            post_shot_rev_duration_ms = MAX_POST_SHOT_REV_MS;
-          }
-          break;
-        case 4:
-          use_idle = !use_idle;
-          break;
-        case 5:
-          rev_is_auto = !rev_is_auto;
-          break;
-      }
-      menu.clicks = 0;
-      trig.clicks = 0;
-      rev.clicks = 0;
-    }
-
-    // hold rev or trigger to rapidly change RPM setting
-    if (rev.clicks < 0 && selected == 1)
-    {
-      while (rev.depressed)
-      {
-        profile_rpm -= RPM_STEP_SIZE;
-        if (profile_rpm < MIN_RPM)
-        {
-          profile_rpm = MAX_RPM;
+          rev.Update();
+          display_settings(selected);
+          delay(30);
         }
-        rev.Update();
-        display_settings(selected);
-        delay(30);
       }
     }
-
     if (trig.clicks < 0 && selected == 1)
     {
       while (trig.depressed)
