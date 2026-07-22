@@ -944,27 +944,33 @@ void display_main()
 //settings screen display output
 void display_settings(byte selected)
 {
-  if (selected > 7)
+  if (selected > 6)
   {
-    // page 2: solenoid settings
+    // page 2: tuning + solenoid settings
     oled.clearDisplay();
     oled.setFont();
     oled.setTextSize(1);
     oled.setCursor(0, 0);
-    oled.print(F("Noid ms (full): "));
+    oled.print(F("Tune PID: "));
     oled.setCursor(96, 0);
+    if (selected == 7) oled.setTextColor(0, 1);
+    oled.print(F("Go"));
+    oled.setTextColor(1, 0);
+    oled.setCursor(0, 9);
+    oled.print(F("Noid ms (full): "));
+    oled.setCursor(96, 9);
     if (selected == 8) oled.setTextColor(0, 1);
     oled.print(noid_settings.ms_full);
     oled.setTextColor(1, 0);
-    oled.setCursor(0, 9);
+    oled.setCursor(0, 18);
     oled.print(F("Noid ms (dead): "));
-    oled.setCursor(96, 9);
+    oled.setCursor(96, 18);
     if (selected == 9) oled.setTextColor(0, 1);
     oled.print(noid_settings.ms_dead);
     oled.setTextColor(1, 0);
-    oled.setCursor(0, 18);
+    oled.setCursor(0, 27);
     oled.print(F("Save noid cfg: "));
-    oled.setCursor(96, 18);
+    oled.setCursor(96, 27);
     if (selected == 10) oled.setTextColor(0, 1);
     oled.print(F("Save"));
     oled.setTextColor(1, 0);
@@ -1015,11 +1021,7 @@ void display_settings(byte selected)
   oled.print(F("Save"));
   oled.setTextColor(1, 0);
   oled.setCursor(0, 54);
-  oled.print(F("Tune PID: "));
-  oled.setCursor(96, 54);
-  if (selected == 7) oled.setTextColor(0, 1);
-  oled.print(F("Go"));
-  oled.setTextColor(1, 0);
+  oled.print(F("Page 1/2"));
   oled.display();
 }
 
