@@ -7,6 +7,8 @@
 #include <Adafruit_SSD1306.h>
 #include <LittleFS.h>
 #include "flywheelmotor.h"
+#include "tuningconstants.h"
+#include "solenoidsettings.h"
 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -169,12 +171,11 @@ unsigned long last_fire_timestamp = 0;  //stores timestamp of last solenoid fire
 unsigned long safety_timer = 0;         //counts up while revving for safety shutoff
 bool revved = false;
 
-// PID constants and feedforward curve parameters
-float Kp = .6;            // throttle per RPM
-float Ki = 1.6;             // throttle / (RPM * s)
-float Kd = 0.0003;          // throttle*s / RPM
-float feed_forward_curve_offset = 56074.0f;   // the throttle/rpm curve for plus motors, robo spirit wheels, and a 4s battery
-float feed_forward_curve_exponent = 12952.0f; // was measured to be *about* RPM = -56074 + 12952 ln(throttle)
+// PID constants and feedforward curve parameters - per-blaster, persisted to LittleFS.
+// Defaults (and the file format) live in tuningconstants.h; run "Tune PID" from the
+// settings menu to fit these to your motors/wheels/battery.
+TuningConstants tuning;
+volatile bool tuning_save_requested = false;  // core 1 requests, core 0 performs the flash write
 
 // Motor stuff
 FlywheelMotor *left_motor;
@@ -193,7 +194,12 @@ void set_target_rpm(uint32_t rpm);
 void rev_down();
 
 /* SOLENOID STUFF */
-uint8_t noid_extend_ms = 16; // power pulse time for solenoid - this is dynamic based on voltage
+// User-settable push durations (settings page 2), persisted to LittleFS in
+// their own file. noid_extend_ms is remapped between these two endpoints as
+// the battery sags.
+SolenoidSettings noid_settings;
+volatile bool noid_save_requested = false;  // core 1 requests, core 0 performs the flash write
+uint8_t noid_extend_ms = DEFAULT_NOID_MS_FULL; // power pulse time for solenoid - this is dynamic based on voltage
 const uint8_t noid_retract_ms = 30; // time to wait after retracting solenoid before next action
 volatile byte MAX_ROF_DELAY = ceil((1000 - (MAX_FIRE_RATE * noid_extend_ms)) / MAX_FIRE_RATE);
 byte single_shot_delay = max(ceil((1000/fire_rate) - (noid_extend_ms+noid_retract_ms)), 0);  //how long to wait after powering solenoid before it can be powered again
@@ -215,10 +221,8 @@ void fireNoid();
 /* END SOLENOID STUFF */
 
 
-// Tuning
-void tune_feed_forward();
-void load_feed_forward_constants();
-void save_feed_forward_constants();
+// PID autotune (runs on core 1, takes over the UI until it finishes)
+void run_pid_autotune();
 std::pair<double,double> fitLog(const int *x, const int *y, int n);
 
 void main_loop();

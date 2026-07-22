@@ -264,6 +264,10 @@ void setup()
     }
     load_profile(current_profile);
     Serial.printf("Core 0: Loaded profile %d\n", current_profile);
+    if (tuning.load()) Serial.println("Core 0: Loaded PID tuning constants from flash");
+    else Serial.println("Core 0: Using default PID tuning constants");
+    if (noid_settings.load()) Serial.println("Core 0: Loaded solenoid settings from flash");
+    else Serial.println("Core 0: Using default solenoid settings");
     // Launch Core 1 for UI and control logic
     multicore_launch_core1(core1_main);
 }
@@ -271,8 +275,8 @@ void setup()
 // Initialize motors and solenoid (called from Core 1 after mode selection)
 void initialize_motors() 
 {
-  left_motor = new FlywheelMotor(PIN_LEFT_MOTOR, MOTOR_POLES,  new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
-  right_motor = new FlywheelMotor(PIN_RIGHT_MOTOR, MOTOR_POLES, new PIDControl(Kp, Ki, Kd, feed_forward_curve_offset, feed_forward_curve_exponent, 200));
+  left_motor = new FlywheelMotor(PIN_LEFT_MOTOR, MOTOR_POLES,  new PIDControl(tuning.left, THROTTLE_UPDATE_US));
+  right_motor = new FlywheelMotor(PIN_RIGHT_MOTOR, MOTOR_POLES, new PIDControl(tuning.right, THROTTLE_UPDATE_US));
   if (USE_ESC_SOLENOID)
   {
     solenoid_dshot = new BidirDShotX1(PIN_SOLENOID_OUT, 600);
@@ -526,7 +530,9 @@ void main_loop()
       {
         low_batt = false;
       }
-      noid_extend_ms = map(voltage, 17.0, 14.6, 16, 26);
+      noid_extend_ms = constrain(map(voltage, 17.0, 14.6, noid_settings.ms_full, noid_settings.ms_dead),
+                                 min(noid_settings.ms_full, noid_settings.ms_dead),
+                                 max(noid_settings.ms_full, noid_settings.ms_dead));
     }
 
     if (millis() % SCREEN_UPDATE_MS == 0)
@@ -584,7 +590,7 @@ void main_loop()
         update_display = true;
         selected++;
 
-        if (selected > 6) 
+        if (selected > 10)
         {
           selected = 1;
         }
@@ -628,6 +634,7 @@ void main_loop()
           rev_is_auto = !rev_is_auto;
           break;
         case 6:
+        {
           // Save current profile to filesystem
           save_requested = true;
           bool done = false;
@@ -645,6 +652,49 @@ void main_loop()
           oled.display();
           delay(1000);  // Show message briefly
           break;
+        }
+        case 7:
+          // PID autotune - takes over the screen and buttons until it finishes
+          run_pid_autotune();
+          trig.clicks = 0;
+          menu.clicks = 0;
+          rev.clicks = 0;
+          update_display = true;
+          break;
+        case 8:
+          noid_settings.ms_full += 1;
+          if (noid_settings.ms_full > NOID_MS_MAX)
+          {
+            noid_settings.ms_full = NOID_MS_MIN;
+          }
+          break;
+        case 9:
+          noid_settings.ms_dead += 1;
+          if (noid_settings.ms_dead > NOID_MS_MAX)
+          {
+            noid_settings.ms_dead = NOID_MS_MIN;
+          }
+          break;
+        case 10:
+        {
+          // Save solenoid settings to filesystem
+          noid_save_requested = true;
+          bool done = false;
+          while (!done)
+          {
+            mutex_enter_blocking(&save_mutex);
+            if (!noid_save_requested) done = true;
+            mutex_exit(&save_mutex);
+            delay(10);
+          }
+          // Visual feedback
+          oled.clearDisplay();
+          oled.setCursor(0, 28);
+          oled.print(F("Noid Saved!"));
+          oled.display();
+          delay(1000);  // Show message briefly
+          break;
+        }
       }
       menu.clicks = 0;
       trig.clicks = 0;
@@ -686,6 +736,20 @@ void main_loop()
             break;
           case 5:
             rev_is_auto = !rev_is_auto;
+            break;
+          case 8:
+            noid_settings.ms_full -= 1;
+            if (noid_settings.ms_full < NOID_MS_MIN)
+            {
+              noid_settings.ms_full = NOID_MS_MAX;
+            }
+            break;
+          case 9:
+            noid_settings.ms_dead -= 1;
+            if (noid_settings.ms_dead < NOID_MS_MIN)
+            {
+              noid_settings.ms_dead = NOID_MS_MAX;
+            }
             break;
         }
         menu.clicks = 0;
@@ -880,44 +944,81 @@ void display_main()
 //settings screen display output
 void display_settings(byte selected)
 {
+  if (selected > 7)
+  {
+    // page 2: solenoid settings
+    oled.clearDisplay();
+    oled.setFont();
+    oled.setTextSize(1);
+    oled.setCursor(0, 0);
+    oled.print(F("Noid ms (full): "));
+    oled.setCursor(96, 0);
+    if (selected == 8) oled.setTextColor(0, 1);
+    oled.print(noid_settings.ms_full);
+    oled.setTextColor(1, 0);
+    oled.setCursor(0, 9);
+    oled.print(F("Noid ms (dead): "));
+    oled.setCursor(96, 9);
+    if (selected == 9) oled.setTextColor(0, 1);
+    oled.print(noid_settings.ms_dead);
+    oled.setTextColor(1, 0);
+    oled.setCursor(0, 18);
+    oled.print(F("Save noid cfg: "));
+    oled.setCursor(96, 18);
+    if (selected == 10) oled.setTextColor(0, 1);
+    oled.print(F("Save"));
+    oled.setTextColor(1, 0);
+    oled.setCursor(0, 54);
+    oled.print(F("Page 2/2"));
+    oled.display();
+    return;
+  }
   oled.clearDisplay();
+  oled.setFont();
+  oled.setTextSize(1);
   oled.setCursor(0, 0);
   oled.print(F("RPM: "));
   oled.setCursor(96, 0);
   if (selected == 1) oled.setTextColor(0, 1);
   oled.print(profile_rpm);
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 11);
+  oled.setCursor(0, 9);
   oled.print(F("Fire Rate: "));
-  oled.setCursor(96, 11);
+  oled.setCursor(96, 9);
   if (selected == 2) oled.setTextColor(0, 1);
   oled.print(fire_rate);
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 22);
+  oled.setCursor(0, 18);
   oled.print(F("Post-fire rev: "));
-  oled.setCursor(96, 22);
+  oled.setCursor(96, 18);
   if (selected == 3) oled.setTextColor(0, 1);
   oled.print(post_shot_rev_duration_ms);
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 33);
+  oled.setCursor(0, 27);
   oled.print(F("Idle: "));
-  oled.setCursor(96, 33);
+  oled.setCursor(96, 27);
   if (selected == 4) oled.setTextColor(0, 1);
   if (use_idle) oled.print(F("Yes"));
   else oled.print(F("No"));
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 44);
+  oled.setCursor(0, 36);
   oled.print(F("Rev trigger auto: "));
-  oled.setCursor(96, 44);
+  oled.setCursor(96, 36);
   if (selected == 5) oled.setTextColor(0, 1);
   if (rev_is_auto) oled.print(F("Yes"));
   else oled.print(F("No"));
   oled.setTextColor(1, 0);
-  oled.setCursor(0, 55);
+  oled.setCursor(0, 45);
   oled.print(F("Save Profile: "));
-  oled.setCursor(96, 55);
+  oled.setCursor(96, 45);
   if (selected == 6) oled.setTextColor(0, 1);
   oled.print(F("Save"));
+  oled.setTextColor(1, 0);
+  oled.setCursor(0, 54);
+  oled.print(F("Tune PID: "));
+  oled.setCursor(96, 54);
+  if (selected == 7) oled.setTextColor(0, 1);
+  oled.print(F("Go"));
   oled.setTextColor(1, 0);
   oled.display();
 }
@@ -1040,7 +1141,9 @@ void core1_main()
   oled.display();
   oled.clearDisplay();
   initialize_motors();
-  noid_extend_ms = map(voltage, 17.0, 14.6, 17, 26);
+  noid_extend_ms = constrain(map(voltage, 17.0, 14.6, noid_settings.ms_full, noid_settings.ms_dead),
+                             min(noid_settings.ms_full, noid_settings.ms_dead),
+                             max(noid_settings.ms_full, noid_settings.ms_dead));
   if (use_idle)
   {
     set_target_rpm(IDLE_RPM);
@@ -1058,10 +1161,22 @@ void loop()
 {
     // Allow formatting/save requests to be handled even before motors are initialized
     mutex_enter_blocking(&save_mutex);
-    if (save_requested) 
+    if (save_requested)
     {
         save_current_profile(current_profile);
         save_requested = false;
+    }
+    if (tuning_save_requested)
+    {
+        if (tuning.save()) Serial.println("PID tuning constants saved");
+        else Serial.println("PID tuning constants save FAILED");
+        tuning_save_requested = false;
+    }
+    if (noid_save_requested)
+    {
+        if (noid_settings.save()) Serial.println("Solenoid settings saved");
+        else Serial.println("Solenoid settings save FAILED");
+        noid_save_requested = false;
     }
     if (format_requested)
     {
@@ -1104,133 +1219,609 @@ void loop()
     delayMicroseconds(200);
 }
 
-void tune_feed_forward() 
-{
-  motors_initialized = false; // Pause motor loop while swapping algorithms
-  delayMicroseconds(500); // Ensure motor loop is paused
-  FlywheelControlAlgorithm* ff_algo_left = left_motor->control_algorithm;
-  FlywheelControlAlgorithm* ff_algo_right = right_motor->control_algorithm;
-  left_motor->control_algorithm = new BasicPWMControl(0);
-  right_motor->control_algorithm = new BasicPWMControl(0);
-  motors_initialized = true; // Resume motor loop with new algorithms
+/////////////////////////////// PID AUTOTUNE ///////////////////////////////
+// Runs on core 1 (the UI core). Core 0 keeps streaming throttle packets the
+// whole time, so the tuner works by swapping control algorithms in and out
+// under the motor mutex and watching the RPM values core 0 publishes.
+//
+// Each wheel is tuned independently, but always with BOTH wheels spinning:
+// the motors share one battery, so the combined draw is part of the plant
+// being tuned.
+//
+// Sequence (trigger = consent, menu = abort, at every step):
+//   1/3  Feed-forward sweep: 9 open-loop throttle points, log-fit each
+//        wheel's throttle->RPM curve
+//   2/3  Relay tests: bang-bang both wheels around each grid target
+//        (nominally 12k/20k/30k RPM, limited to what the wheels can reach)
+//        to measure each wheel's ultimate gain Ku and period Tu, then
+//        Ziegler-Nichols "some overshoot" gains per wheel per target.
+//        The result is a gain grid; PIDControl interpolates it for whatever
+//        RPM a profile asks for (gain scheduling).
+//   3/3  Step-response check at the highest grid target (the hardest case
+//        for oscillation). Backs a wheel's gains off if it overshoots or
+//        oscillates, bumps them up if sluggish.
+// The result is shown and only written to flash if the user accepts it.
 
-  int throttle_rpms[9] = {0,0,0,0,0,0,0,0,0};
-  for (int i = 1; i < 10; i++) 
-  {
+#define TUNE_MAX_RPM 45000            // hard abort if either wheel exceeds this
+#define TUNE_MIN_VOLTAGE 13.6f        // hard abort if the pack sags below this mid-spin
+#define TUNE_FF_STABILIZE_MS 1500     // per-point settling time in the feed-forward sweep
+#define TUNE_FF_SAMPLE_MS 300         // per-point measurement time
+#define TUNE_RELAY_CROSSINGS 8        // up-crossings recorded (early cycles are discarded)
+#define TUNE_RELAY_TIMEOUT_MS 12000
+#define TUNE_STEP_SAMPLE_MS 1500      // step-response observation window
+#define TUNE_MAX_VERIFY_ITERATIONS 3
+#define TUNE_GRID_MAX_FRACTION 0.85f  // grid targets must sit below this fraction of measured max RPM
+#define TUNE_MIN_TARGET 8000
+static const uint32_t TUNE_GRID_NOMINAL[MAX_GAIN_POINTS] = {12000, 20000, 30000};
+
+typedef struct
+{
+    float os_pct;          // peak above target during spinup
+    float band_pct;        // peak-to-peak wobble over the last 300 ms, % of target
+    uint32_t t90_ms;       // time to first reach 90% of target
+} StepMetrics;
+
+// One wheel's relay-test state
+typedef struct
+{
+    float base;            // feed-forward throttle at the target
+    float h;               // relay amplitude
+    bool high;
+    bool done;
+    int crossings;
+    uint32_t crossing_us[TUNE_RELAY_CROSSINGS];
+    uint32_t cyc_min[TUNE_RELAY_CROSSINGS];
+    uint32_t cyc_max[TUNE_RELAY_CROSSINGS];
+    uint32_t cur_min;
+    uint32_t cur_max;
+    float Ku;
+    float Tu;
+} RelayChannel;
+
+static const char* tune_abort_reason = nullptr;
+
+// Swap both motors' control algorithms under the mutex and free the old ones.
+// Core 0 only touches control_algorithm inside the same mutex, so this is safe
+// without pausing the motor loop.
+static void tune_swap_algorithms(FlywheelControlAlgorithm* new_left, FlywheelControlAlgorithm* new_right)
+{
+    mutex_enter_blocking(&motor_mutex);
+    FlywheelControlAlgorithm* old_left = left_motor->control_algorithm;
+    FlywheelControlAlgorithm* old_right = right_motor->control_algorithm;
+    left_motor->control_algorithm = new_left;
+    right_motor->control_algorithm = new_right;
+    mutex_exit(&motor_mutex);
+    delete old_left;
+    delete old_right;
+}
+
+static void tune_set_throttle_lr(uint32_t throttle_left, uint32_t throttle_right)
+{
+    mutex_enter_blocking(&motor_mutex);
+    left_motor->control_algorithm->set_throttle(throttle_left);
+    right_motor->control_algorithm->set_throttle(throttle_right);
+    mutex_exit(&motor_mutex);
+}
+
+static void tune_set_throttle(uint32_t throttle)
+{
+    tune_set_throttle_lr(throttle, throttle);
+}
+
+// Safety net for every loop that has the wheels moving:
+// overspeed, user abort via menu button, and battery collapse.
+static bool tune_guard()
+{
+    static uint32_t last_batt_check = 0;
+    if (current_rpm_left > TUNE_MAX_RPM || current_rpm_right > TUNE_MAX_RPM)
+    {
+        tune_abort_reason = "Overspeed!";
+        return false;
+    }
+    if (digitalRead(PIN_MENU_IN) == LOW)
+    {
+        tune_abort_reason = "User abort";
+        return false;
+    }
+    if (millis() - last_batt_check >= BATTERY_CHECK_MS)
+    {
+        last_batt_check = millis();
+        check_battery();
+        // lower bar than LOW_BATTERY_THRESHOLD - healthy packs sag under load
+        if (voltage < TUNE_MIN_VOLTAGE)
+        {
+            tune_abort_reason = "Battery sagged";
+            return false;
+        }
+    }
+    return true;
+}
+
+static void tune_screen(const char* l1, const char* l2, const char* l3, const char* l4, const char* footer)
+{
     oled.clearDisplay();
     oled.setFont();
     oled.setTextSize(1);
-    oled.setCursor(0, 5);
-    oled.print("Feed forward tuning");
-    oled.setCursor(0, 20);
-    oled.print("Step 1: RPM test");
-    oled.setCursor(0, 35);
-    oled.print("Phase ");
-    oled.print(i);
-    oled.print("/9");
-    oled.setCursor(0, 50);
-    oled.print("Press trigger to start");
+    if (l1) { oled.setCursor(0, 0);  oled.print(l1); }
+    if (l2) { oled.setCursor(0, 14); oled.print(l2); }
+    if (l3) { oled.setCursor(0, 28); oled.print(l3); }
+    if (l4) { oled.setCursor(0, 41); oled.print(l4); }
+    if (footer) { oled.setCursor(0, 54); oled.print(footer); }
     oled.display();
-    
-    while (digitalRead(PIN_FIRE_IN) == HIGH)
+}
+
+static void tune_wait_release()
+{
+    while (digitalRead(PIN_FIRE_IN) == LOW || digitalRead(PIN_MENU_IN) == LOW) delay(10);
+    delay(50); // debounce
+}
+
+// Wait on whatever is on screen. Trigger = yes, menu = no/abort.
+static bool tune_consent_wait()
+{
+    tune_wait_release();
+    while (true)
     {
+        if (digitalRead(PIN_FIRE_IN) == LOW) { tune_wait_release(); return true; }
+        if (digitalRead(PIN_MENU_IN) == LOW) { tune_wait_release(); tune_abort_reason = "User abort"; return false; }
+        delay(10);
+    }
+}
+
+static bool tune_consent(const char* l1, const char* l2, const char* l3, const char* l4 = nullptr)
+{
+    tune_screen(l1, l2, l3, l4, "Trig=GO   Menu=QUIT");
+    return tune_consent_wait();
+}
+
+// Phase 1: open-loop throttle sweep with both wheels spinning; log-fit
+// RPM = a*ln(throttle) + b for each wheel separately.
+static bool tune_ff_sweep(TuningConstants &cand, uint32_t &max_rpm_left, uint32_t &max_rpm_right)
+{
+    const int num_points = 9;
+    int throttles[num_points];
+    int rpms_left[num_points];
+    int rpms_right[num_points];
+
+    for (int i = 0; i < num_points; i++)
+    {
+        int throttle = (i + 1) * 200;
+        throttles[i] = throttle;
+
+        oled.clearDisplay();
+        oled.setFont();
+        oled.setTextSize(1);
+        oled.setCursor(0, 0);  oled.print(F("1/3 Feed-forward"));
+        oled.setCursor(0, 14); oled.print(F("Point ")); oled.print(i + 1); oled.print(F("/9 Thr ")); oled.print(throttle);
+        oled.setCursor(0, 54); oled.print(F("Menu=ABORT"));
+        oled.display();
+
+        tune_set_throttle(throttle);
+
+        uint32_t t0 = millis();
+        while (millis() - t0 < TUNE_FF_STABILIZE_MS)
+        {
+            if (!tune_guard()) return false;
+            delay(5);
+        }
+
+        // sample every 5 ms so the average spans many telemetry updates
+        uint32_t sum_left = 0, sum_right = 0;
+        int samples = 0;
+        t0 = millis();
+        while (millis() - t0 < TUNE_FF_SAMPLE_MS)
+        {
+            if (!tune_guard()) return false;
+            sum_left += current_rpm_left;
+            sum_right += current_rpm_right;
+            samples++;
+            delay(5);
+        }
+        rpms_left[i] = sum_left / samples;
+        rpms_right[i] = sum_right / samples;
+
+        if (i == 0 && (rpms_left[0] < 500 || rpms_right[0] < 500))
+        {
+            tune_abort_reason = "No RPM signal";
+            return false;
+        }
+        // wheels may differ, but a large gap at the same throttle means a
+        // dying motor/ESC, junk telemetry, or something rubbing
+        int32_t diff = (int32_t)rpms_left[i] - (int32_t)rpms_right[i];
+        if (diff < 0) diff = -diff;
+        if (diff > (rpms_left[i] + rpms_right[i]) / 8)
+        {
+            tune_abort_reason = "Wheel mismatch";
+            return false;
+        }
+        if (i > 0 && (rpms_left[i] <= rpms_left[i - 1] || rpms_right[i] <= rpms_right[i - 1]))
+        {
+            tune_abort_reason = "RPM not rising";
+            return false;
+        }
+    }
+    tune_set_throttle(0);
+
+    std::pair<double, double> fit_left = fitLog(throttles, rpms_left, num_points);
+    std::pair<double, double> fit_right = fitLog(throttles, rpms_right, num_points);
+    if (fit_left.first < 500.0 || fit_left.first > 100000.0 ||
+        fit_right.first < 500.0 || fit_right.first > 100000.0)
+    {
+        tune_abort_reason = "Bad FF fit";
+        return false;
+    }
+    cand.left.ff_exponent = (float)fit_left.first;
+    cand.left.ff_offset = -(float)fit_left.second;
+    cand.right.ff_exponent = (float)fit_right.first;
+    cand.right.ff_offset = -(float)fit_right.second;
+    max_rpm_left = rpms_left[num_points - 1];
+    max_rpm_right = rpms_right[num_points - 1];
+    return true;
+}
+
+// Set up one wheel's relay channel. Returns false if there isn't enough
+// throttle headroom to oscillate around this target.
+static bool tune_relay_setup(RelayChannel &ch, const MotorTune &mt, uint32_t target)
+{
+    ch.base = mt.feed_forward((float)target);
+    // Relay amplitude: 30% of the baseline, limited by the throttle range.
+    // On these log-shaped curves a 12k target can sit near base=190, so the
+    // low side is allowed down to 100 - the wheel only visits it briefly at
+    // the bottom of each oscillation.
+    ch.h = 0.30f * ch.base;
+    if (ch.h > 1900.0f - ch.base) ch.h = 1900.0f - ch.base;
+    if (ch.h > ch.base - 100.0f)  ch.h = ch.base - 100.0f;
+    ch.high = true;
+    ch.done = false;
+    ch.crossings = 0;
+    ch.cur_min = UINT32_MAX;
+    ch.cur_max = 0;
+    ch.Ku = 0.0f;
+    ch.Tu = 0.0f;
+    return (ch.h >= 20.0f && ch.base >= 130.0f && ch.base <= 1850.0f);
+}
+
+// Advance one wheel's relay state machine; returns the throttle to command.
+static uint32_t tune_relay_step(RelayChannel &ch, uint32_t rpm, uint32_t target)
+{
+    if (ch.done) return (uint32_t)ch.base;  // hold steady while the other wheel finishes
+    if (rpm < ch.cur_min) ch.cur_min = rpm;
+    if (rpm > ch.cur_max) ch.cur_max = rpm;
+    if (!ch.high && rpm + 100 < target)
+    {
+        ch.high = true;
+    }
+    else if (ch.high && rpm > target + 100)
+    {
+        ch.crossing_us[ch.crossings] = micros();
+        ch.cyc_min[ch.crossings] = ch.cur_min;
+        ch.cyc_max[ch.crossings] = ch.cur_max;
+        ch.crossings++;
+        ch.cur_min = UINT32_MAX;
+        ch.cur_max = 0;
+        ch.high = false;
+        if (ch.crossings >= TUNE_RELAY_CROSSINGS) ch.done = true;
+    }
+    return (uint32_t)(ch.high ? ch.base + ch.h : ch.base - ch.h);
+}
+
+// Average the settled cycles into Ku and Tu.
+static bool tune_relay_finish(RelayChannel &ch)
+{
+    float period_sum = 0.0f;
+    float amp_sum = 0.0f;
+    int n = 0;
+    for (int i = 3; i < TUNE_RELAY_CROSSINGS; i++)
+    {
+        period_sum += (float)(ch.crossing_us[i] - ch.crossing_us[i - 1]) * 1e-6f;
+        amp_sum += (float)(ch.cyc_max[i] - ch.cyc_min[i]) / 2.0f;
+        n++;
+    }
+    ch.Tu = period_sum / n;
+    float amp = amp_sum / n;
+    if (amp < 100.0f || ch.Tu < 0.004f || ch.Tu > 2.0f) return false;
+    // Describing-function ultimate gain, corrected for the +/-100 RPM
+    // switching hysteresis (amp always includes the hysteresis band, so the
+    // raw formula would underestimate Ku for small oscillations)
+    float amp_eff = sqrtf(amp * amp - 100.0f * 100.0f);
+    if (amp_eff < 30.0f) return false; // oscillation buried in the hysteresis band
+    ch.Ku = 4.0f * ch.h / (PI * amp_eff);
+    return true;
+}
+
+// Ziegler-Nichols "some overshoot" rule - biased toward reaction time.
+// Kd uses the classic Tu/8 rather than Tu/3: derivative of quantized eRPM
+// is noisy, so we take the milder braking action.
+static GainPoint tune_zn_gains(const RelayChannel &ch, uint32_t target)
+{
+    GainPoint g;
+    g.rpm = (float)target;
+    g.kp = 0.33f * ch.Ku;
+    if (g.kp > 10.0f) g.kp = 10.0f;
+    g.ki = 2.0f * g.kp / ch.Tu;         // Ti = Tu/2
+    if (g.ki > 200.0f) g.ki = 200.0f;
+    g.kd = g.kp * ch.Tu / 8.0f;         // Td = Tu/8
+    if (g.kd > 0.005f) g.kd = 0.005f;
+    return g;
+}
+
+// Phase 2 (one grid point): run both wheels' relays in parallel and store
+// the resulting gains into each wheel's grid.
+static bool tune_relay_point(TuningConstants &cand, uint32_t target, int point_index)
+{
+    RelayChannel chl, chr;
+    if (!tune_relay_setup(chl, cand.left, target) || !tune_relay_setup(chr, cand.right, target))
+    {
+        tune_abort_reason = "Relay range bad";
+        return false;
+    }
+
+    char line[24];
+    snprintf(line, sizeof(line), "%lu RPM...", (unsigned long)target);
+    tune_screen("2/3 Relay test", line, nullptr, nullptr, "Menu=ABORT");
+
+    uint32_t t0 = millis();
+    while (!(chl.done && chr.done))
+    {
+        if (!tune_guard()) { tune_set_throttle(0); return false; }
+        if (millis() - t0 > TUNE_RELAY_TIMEOUT_MS)
+        {
+            tune_set_throttle(0);
+            tune_abort_reason = "Relay timeout";
+            return false;
+        }
+        uint32_t throttle_left = tune_relay_step(chl, current_rpm_left, target);
+        uint32_t throttle_right = tune_relay_step(chr, current_rpm_right, target);
+        tune_set_throttle_lr(throttle_left, throttle_right);
+        delayMicroseconds(500);
+    }
+    tune_set_throttle(0);
+
+    if (!tune_relay_finish(chl) || !tune_relay_finish(chr))
+    {
+        tune_abort_reason = "Osc unusable";
+        return false;
+    }
+    cand.left.points[point_index] = tune_zn_gains(chl, target);
+    cand.right.points[point_index] = tune_zn_gains(chr, target);
+    return true;
+}
+
+// Phase 3: one closed-loop step test, metrics recorded per wheel.
+// The candidate PIDControl instances must already be installed.
+static bool tune_step_response(uint32_t target, StepMetrics &ml, StepMetrics &mr)
+{
+    // make sure we're starting from (near) rest
+    uint32_t t0 = millis();
+    while (current_rpm_left > 1000 || current_rpm_right > 1000)
+    {
+        if (!tune_guard()) return false;
+        if (millis() - t0 > 4000) { tune_abort_reason = "No spindown"; return false; }
         delay(10);
     }
 
+    ml.t90_ms = 0;
+    mr.t90_ms = 0;
+    uint32_t peak_left = 0, peak_right = 0;
+    uint32_t band_min_left = UINT32_MAX, band_max_left = 0;
+    uint32_t band_min_right = UINT32_MAX, band_max_right = 0;
+
+    set_target_rpm(target);
+    t0 = millis();
+    while (millis() - t0 < TUNE_STEP_SAMPLE_MS)
+    {
+        if (!tune_guard()) { set_target_rpm(0); return false; }
+        uint32_t rpm_left = current_rpm_left;
+        uint32_t rpm_right = current_rpm_right;
+        uint32_t elapsed = millis() - t0;
+        if (rpm_left > peak_left) peak_left = rpm_left;
+        if (rpm_right > peak_right) peak_right = rpm_right;
+        if (ml.t90_ms == 0 && rpm_left >= (target * 9) / 10) ml.t90_ms = elapsed;
+        if (mr.t90_ms == 0 && rpm_right >= (target * 9) / 10) mr.t90_ms = elapsed;
+        if (elapsed >= TUNE_STEP_SAMPLE_MS - 300)
+        {
+            if (rpm_left < band_min_left) band_min_left = rpm_left;
+            if (rpm_left > band_max_left) band_max_left = rpm_left;
+            if (rpm_right < band_min_right) band_min_right = rpm_right;
+            if (rpm_right > band_max_right) band_max_right = rpm_right;
+        }
+        delayMicroseconds(500);
+    }
+    set_target_rpm(0);
+
+    if (ml.t90_ms == 0 || mr.t90_ms == 0)
+    {
+        tune_abort_reason = "Never hit 90%";
+        return false;
+    }
+    ml.os_pct = peak_left > target ? (float)(peak_left - target) * 100.0f / (float)target : 0.0f;
+    mr.os_pct = peak_right > target ? (float)(peak_right - target) * 100.0f / (float)target : 0.0f;
+    ml.band_pct = (float)(band_max_left - band_min_left) * 100.0f / (float)target;
+    mr.band_pct = (float)(band_max_right - band_min_right) * 100.0f / (float)target;
+    return true;
+}
+
+// Nudge one wheel's whole gain grid based on its step-test behavior.
+// Returns true if anything changed (another verification pass is needed).
+static bool tune_adjust(MotorTune &mt, const StepMetrics &m)
+{
+    if (m.os_pct > 10.0f || m.band_pct > 8.0f)
+    {
+        mt.scale_gains(0.8f, 0.85f);
+        return true;
+    }
+    if (m.os_pct < 1.0f && m.t90_ms > 350)
+    {
+        mt.scale_gains(1.2f, 1.0f);
+        return true;
+    }
+    return false;
+}
+
+// The full tuning sequence. Returns false if aborted (reason in tune_abort_reason).
+static bool tune_run()
+{
+    TuningConstants cand = tuning;
+    uint32_t max_rpm_left = 0, max_rpm_right = 0;
+    char l2[24], l3[24];
+
+    if (!tune_ff_sweep(cand, max_rpm_left, max_rpm_right)) return false;
+
+    snprintf(l2, sizeof(l2), "L %dlnT-%d", (int)cand.left.ff_exponent, (int)cand.left.ff_offset);
+    snprintf(l3, sizeof(l3), "R %dlnT-%d", (int)cand.right.ff_exponent, (int)cand.right.ff_offset);
+    if (!tune_consent("1/3 FF fit done", l2, l3)) return false;
+
+    // Build the gain grid: nominal targets both wheels can comfortably reach
+    // (the relay needs headroom above the target to oscillate).
+    uint32_t max_rpm = min(max_rpm_left, max_rpm_right);
+    uint32_t max_ok = (uint32_t)(TUNE_GRID_MAX_FRACTION * (float)max_rpm);
+    uint32_t grid[MAX_GAIN_POINTS];
+    int n_grid = 0;
+    for (int i = 0; i < MAX_GAIN_POINTS; i++)
+    {
+        if (TUNE_GRID_NOMINAL[i] <= max_ok) grid[n_grid++] = TUNE_GRID_NOMINAL[i];
+    }
+    if (n_grid == 0)
+    {
+        if (max_ok < TUNE_MIN_TARGET)
+        {
+            tune_abort_reason = "Wheels too slow";
+            return false;
+        }
+        grid[n_grid++] = max_ok;
+    }
+
+    int n_used = 0;
+    for (int i = 0; i < n_grid; i++)
+    {
+        // Pre-check throttle headroom so an out-of-range point is skipped
+        // instead of killing the whole tune
+        RelayChannel probe_left, probe_right;
+        if (!tune_relay_setup(probe_left, cand.left, grid[i]) ||
+            !tune_relay_setup(probe_right, cand.right, grid[i]))
+        {
+            snprintf(l2, sizeof(l2), "Skip %lu RPM", (unsigned long)grid[i]);
+            tune_screen("2/3 Relay tests", l2, "(no headroom)", nullptr, nullptr);
+            delay(1500);
+            continue;
+        }
+        snprintf(l2, sizeof(l2), "Relay %d/%d", i + 1, n_grid);
+        snprintf(l3, sizeof(l3), "at %lu RPM", (unsigned long)grid[i]);
+        if (!tune_consent("2/3 Relay tests", l2, l3)) return false;
+        if (!tune_relay_point(cand, grid[i], n_used)) return false;
+        grid[n_used] = grid[i];
+        n_used++;
+    }
+    if (n_used == 0)
+    {
+        tune_abort_reason = "No usable targets";
+        return false;
+    }
+    cand.left.num_points = n_used;
+    cand.right.num_points = n_used;
+
+    // Verify at the highest grid target - the hardest case for overshoot
+    // and oscillation. Gain scheduling covers everything below it.
+    uint32_t verify_target = grid[n_used - 1];
+
+    StepMetrics metrics_left, metrics_right;
+    for (int iter = 0; iter < TUNE_MAX_VERIFY_ITERATIONS; iter++)
+    {
+        tune_swap_algorithms(new PIDControl(cand.left, THROTTLE_UPDATE_US),
+                             new PIDControl(cand.right, THROTTLE_UPDATE_US));
+
+        snprintf(l2, sizeof(l2), "Try %d at %lu", iter + 1, (unsigned long)verify_target);
+        if (!tune_consent("3/3 Step test", l2, "Full spinup!")) return false;
+        tune_screen("3/3 Step test", "Running...", nullptr, nullptr, "Menu=ABORT");
+        if (!tune_step_response(verify_target, metrics_left, metrics_right)) return false;
+
+        if (iter < TUNE_MAX_VERIFY_ITERATIONS - 1)
+        {
+            bool adjusted_left = tune_adjust(cand.left, metrics_left);
+            bool adjusted_right = tune_adjust(cand.right, metrics_right);
+            if (adjusted_left || adjusted_right) continue;
+        }
+        break;
+    }
+
+    // results + save prompt
+    float kp_left, ki_left, kd_left, kp_right, ki_right, kd_right;
+    cand.left.gains_at((float)verify_target, kp_left, ki_left, kd_left);
+    cand.right.gains_at((float)verify_target, kp_right, ki_right, kd_right);
     oled.clearDisplay();
     oled.setFont();
     oled.setTextSize(1);
-    oled.setCursor(30, 20);
-    oled.print("Throttle: ");
-    oled.print(i * 200);
-    oled.setCursor(0, 40);
-    oled.print("TEST IN PROGRESS!");
+    oled.setCursor(0, 0);  oled.print(F("L Kp=")); oled.print(kp_left, 2); oled.print(F(" OS=")); oled.print(metrics_left.os_pct, 1); oled.print(F("%"));
+    oled.setCursor(0, 10); oled.print(F("R Kp=")); oled.print(kp_right, 2); oled.print(F(" OS=")); oled.print(metrics_right.os_pct, 1); oled.print(F("%"));
+    oled.setCursor(0, 20); oled.print(F("t90 L=")); oled.print(metrics_left.t90_ms); oled.print(F(" R=")); oled.print(metrics_right.t90_ms);
+    oled.setCursor(0, 32); oled.print(F("Grid ")); oled.print(n_used); oled.print(F(" pt, top ")); oled.print((unsigned long)grid[n_used - 1]);
+    oled.setCursor(0, 54); oled.print(F("Trig=SAVE Menu=NO"));
     oled.display();
+    bool save_it = tune_consent_wait();
+    tune_abort_reason = nullptr;  // declining the save is not an abort
 
-    mutex_enter_blocking(&motor_mutex);
-    left_motor->control_algorithm->set_throttle(i * 200);
-    mutex_exit(&motor_mutex);
-
-    delay(1500); // Wait for motor to stabilize
-    uint32_t rpm_sum = 0;
-    for (int j = 0; j < 50; j++) 
+    if (save_it && cand.is_sane())
     {
-      rpm_sum += current_rpm_left;
-      delayMicroseconds(200);
+        tuning = cand;
+        mutex_enter_blocking(&save_mutex);
+        tuning_save_requested = true;
+        mutex_exit(&save_mutex);
+        uint32_t t0 = millis();
+        while (tuning_save_requested && millis() - t0 < 3000) delay(10);
+        tune_screen("Saved!", nullptr, nullptr, nullptr, nullptr);
+        delay(800);
+    }
+    else if (save_it)
+    {
+        tune_screen("Result failed", "sanity checks -", "keeping old values", nullptr, nullptr);
+        delay(2000);
+    }
+    return true;
+}
+
+void run_pid_autotune()
+{
+    tune_abort_reason = nullptr;
+    retractNoid();
+    set_target_rpm(0);
+
+    if (!tune_consent("PID AUTOTUNE", "Wheels WILL spin!", "Remove darts + mag", "Tunes 12k-30k grid"))
+    {
+        tune_abort_reason = nullptr;
+        return;
     }
 
-    mutex_enter_blocking(&motor_mutex);
-    left_motor->control_algorithm->set_throttle(0);
-    mutex_exit(&motor_mutex);
+    // fill the voltage running average with fresh readings before deciding
+    for (int i = 0; i < 10; i++)
+    {
+        check_battery();
+        delay(20);
+    }
+    if (voltage < LOW_BATTERY_THRESHOLD)
+    {
+        tune_screen("PID AUTOTUNE", "Battery too low", "to tune safely", nullptr, "Trig=OK");
+        tune_consent_wait();
+        tune_abort_reason = nullptr;
+        return;
+    }
 
-    throttle_rpms[i-1] = rpm_sum / 50;
-  }
-  
-  oled.clearDisplay();
-  oled.setFont();
-  oled.setTextSize(1);
-  oled.setCursor(20, 0);
-  oled.print("Test Complete!");
-  oled.setCursor(0, 12);
-  oled.print("200: ");
-  oled.print(throttle_rpms[0]);
-  oled.setCursor(64, 12);
-  oled.print("400: ");
-  oled.print(throttle_rpms[1]);
-  oled.setCursor(0, 24);
-  oled.print("600: ");
-  oled.print(throttle_rpms[2]);
-  oled.setCursor(64, 24);
-  oled.print("800: ");
-  oled.print(throttle_rpms[3]);
-  oled.setCursor(0, 36);
-  oled.print("1000: "); 
-  oled.print(throttle_rpms[4]);
-  oled.setCursor(64, 36);
-  oled.print("1200: ");
-  oled.print(throttle_rpms[5]);
-  oled.setCursor(0, 48);
-  oled.print("1400: ");
-  oled.print(throttle_rpms[6]);
-  oled.setCursor(64, 48);
-  oled.print("1600: ");
-  oled.print(throttle_rpms[7]);
-  oled.setCursor(0, 60);
-  oled.print("1800: ");
-  oled.print(throttle_rpms[8]);
-  oled.setCursor(64, 60);
-  oled.print("Trigger...");
-  oled.display();
+    // open-loop control for the measurement phases (frees the current PIDControls)
+    tune_swap_algorithms(new BasicPWMControl(0), new BasicPWMControl(0));
 
-  while (digitalRead(PIN_FIRE_IN) == HIGH)
-  {
-      delay(10);
-  }
+    bool finished = tune_run();
 
-  int x[9] = {200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800};
-  std::pair<double, double> log_params = fitLog(x, throttle_rpms, 9);
+    // stop everything and restore closed-loop control with whatever `tuning`
+    // now holds (the new constants if the user saved, the old ones otherwise)
+    tune_swap_algorithms(new PIDControl(tuning.left, THROTTLE_UPDATE_US),
+                         new PIDControl(tuning.right, THROTTLE_UPDATE_US));
+    set_target_rpm(0);
 
-  oled.clearDisplay();
-  oled.setFont();
-  oled.setTextSize(1);
-  oled.setCursor(10, 0);
-  oled.print("Tuning complete!");
-  oled.setCursor(0, 12);
-  oled.print("Estimated curve: ");
-  oled.setCursor(0, 24);
-  oled.print("R=");
-  oled.print(int(log_params.second));
-  oled.print("ln(T)+");
-  oled.print(int(log_params.first));
-  oled.display();
-
-  motors_initialized = false; // Pause motor loop while swapping algorithms
-  delayMicroseconds(500); // Ensure motor loop is paused
-  delete left_motor->control_algorithm;
-  delete right_motor->control_algorithm;
-  left_motor->control_algorithm = ff_algo_left;
-  right_motor->control_algorithm = ff_algo_right;
-  motors_initialized = true; // Resume motor loop with new algorithms
+    if (!finished)
+    {
+        tune_screen("Tune stopped:", tune_abort_reason ? tune_abort_reason : "unknown", nullptr, nullptr, "Trig=OK");
+        tune_consent_wait();
+        tune_abort_reason = nullptr;
+    }
 }
 
 std::pair<double,double> fitLog(
