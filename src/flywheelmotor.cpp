@@ -42,21 +42,52 @@ uint32_t FlywheelMotor::update_rpm()
             break;
         case BidirDshotTelemetryType::VOLTAGE:
             voltage = (float)returnValue / 4;
+            last_edt_frame_ms = millis();
             break;
         case BidirDshotTelemetryType::CURRENT:
             current = returnValue;
+            last_edt_frame_ms = millis();
             break;
         case BidirDshotTelemetryType::TEMPERATURE:
             temp = returnValue;
+            last_edt_frame_ms = millis();
             break;
         case BidirDshotTelemetryType::STATUS:
             lastStatus = returnValue;
+            last_edt_frame_ms = millis();
             break;
         case BidirDshotTelemetryType::STRESS:
             stress = returnValue & ESC_STATUS_MAX_STRESS_MASK;
+            last_edt_frame_ms = millis();
             break;
     }
     return this->actual_rpm;
+}
+
+// Ask the ESC to interleave extended telemetry (temperature/voltage/current/
+// status/stress) frames into the bidir DShot stream. EDT is opt-in: without
+// DShot command 13 the ESC only ever sends eRPM frames. sendRaw11Bit sets the
+// telemetry-request bit, which the command requires (sendThrottle does not).
+// Only call while the motor is stopped - ESCs ignore commands while spinning.
+void FlywheelMotor::enable_edt()
+{
+    for (int i = 0; i < 10; i++)
+    {
+        dshot->sendRaw11Bit(DSHOT_CMD_EXTENDED_TELEMETRY_ENABLE);
+        delayMicroseconds(200);
+    }
+    last_edt_enable_ms = millis();
+}
+
+// EDT resets whenever the ESC power cycles (e.g. a brownout mid-session), so
+// if the extended frames stop arriving, re-send the enable burst. Call this
+// only while the motor is stopped. Rate-limited so an ESC that simply doesn't
+// support EDT only sees a short burst every 10 s.
+void FlywheelMotor::maybe_reenable_edt()
+{
+    if (millis() - last_edt_frame_ms < 10000) return;  // frames still flowing
+    if (millis() - last_edt_enable_ms < 10000) return; // recently attempted
+    enable_edt();
 }
 
 void FlywheelMotor::send_throttle() 

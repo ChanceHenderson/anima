@@ -282,8 +282,8 @@ void initialize_motors()
     solenoid_dshot = new BidirDShotX1(PIN_SOLENOID_OUT, 600);
     solenoid_dshot->sendThrottle(SOLENOID_OFF);
   }
-    // Enable extended telemetry on both motors
-    for (int i = 0; i < 5000; i++) 
+    // Arm both ESCs with a stream of zero-throttle packets
+    for (int i = 0; i < 5000; i++)
     {
         left_motor->get_dshot_instance()->sendThrottle(0);
         right_motor->get_dshot_instance()->sendThrottle(0);
@@ -294,15 +294,36 @@ void initialize_motors()
         delayMicroseconds(200);
     }
 
-    for (int i = 0; i < 20; i++) 
+    for (int i = 0; i < 20; i++)
     {
         uint32_t left_packet;
         uint32_t right_packet;
         delayMicroseconds(100);
         BidirDshotTelemetryType bdirtype_left = left_motor->get_dshot_instance()->getTelemetryRaw(&left_packet);
-        BidirDshotTelemetryType bdirtype_right = right_motor->get_dshot_instance()->getTelemetryRaw(&right_packet);        
+        BidirDshotTelemetryType bdirtype_right = right_motor->get_dshot_instance()->getTelemetryRaw(&right_packet);
         delayMicroseconds(200);
     }
+
+    // Enable Extended DShot Telemetry. EDT is opt-in per the spec - the ESC
+    // only interleaves temp/voltage/current/status frames after DShot command
+    // 13 arrives with the telemetry bit set (this is what a flight controller
+    // sends at arm). Zero-throttle packets alone never turn it on.
+    left_motor->enable_edt();
+    right_motor->enable_edt();
+    // Verify it came up: the spec says the ESC acknowledges within 32 packets,
+    // so keep the zero-throttle stream going briefly and watch for any
+    // extended frame. Failure isn't fatal - RPM telemetry still works.
+    uint32_t edt_verify_start = millis();
+    while (millis() - edt_verify_start < 1500)
+    {
+        left_motor->send_throttle();   // target is 0, so this streams zero throttle
+        right_motor->send_throttle();
+        if (left_motor->get_last_edt_frame_ms() != 0 && right_motor->get_last_edt_frame_ms() != 0) break;
+        delayMicroseconds(200);
+    }
+    Serial.printf("EDT status - left: %s, right: %s\n",
+                  left_motor->get_last_edt_frame_ms() != 0 ? "OK" : "no frames",
+                  right_motor->get_last_edt_frame_ms() != 0 ? "OK" : "no frames");
     motors_initialized = true;
 }
 
@@ -590,7 +611,7 @@ void main_loop()
         update_display = true;
         selected++;
 
-        if (selected > 10)
+        if (selected > 11)
         {
           selected = 1;
         }
@@ -695,6 +716,14 @@ void main_loop()
           delay(1000);  // Show message briefly
           break;
         }
+        case 11:
+          // ESC telemetry dashboard - takes over the screen until menu is pressed
+          show_edt_dashboard();
+          trig.clicks = 0;
+          menu.clicks = 0;
+          rev.clicks = 0;
+          update_display = true;
+          break;
       }
       menu.clicks = 0;
       trig.clicks = 0;
@@ -974,6 +1003,12 @@ void display_settings(byte selected)
     if (selected == 10) oled.setTextColor(0, 1);
     oled.print(F("Save"));
     oled.setTextColor(1, 0);
+    oled.setCursor(0, 36);
+    oled.print(F("ESC dashboard: "));
+    oled.setCursor(96, 36);
+    if (selected == 11) oled.setTextColor(0, 1);
+    oled.print(F("Go"));
+    oled.setTextColor(1, 0);
     oled.setCursor(0, 54);
     oled.print(F("Page 2/2"));
     oled.display();
@@ -1203,15 +1238,25 @@ void loop()
   // Core 0's only job: send throttle to motors every 200us
   // Use mutex to safely access motors while Core 1 may be setting target RPM
     mutex_enter_blocking(&motor_mutex);
-    if (left_motor != nullptr) 
+    if (left_motor != nullptr)
     {
         left_motor->send_throttle();
         current_rpm_left = left_motor->get_current_rpm();
+        // EDT resets if the ESC power cycles - re-send the enable burst if
+        // extended frames stop, but only while the wheel is commanded off
+        if (left_motor->control_algorithm->get_throttle() == 0)
+        {
+            left_motor->maybe_reenable_edt();
+        }
     }
-    if (right_motor != nullptr) 
+    if (right_motor != nullptr)
     {
         right_motor->send_throttle();
         current_rpm_right = right_motor->get_current_rpm();
+        if (right_motor->control_algorithm->get_throttle() == 0)
+        {
+            right_motor->maybe_reenable_edt();
+        }
     }
   if (solenoid_dshot != nullptr)
   {
@@ -1779,6 +1824,63 @@ static bool tune_run()
         delay(2000);
     }
     return true;
+}
+
+// Live view of the most recent Extended DShot Telemetry values from each ESC.
+// Values refresh in place; core 0 keeps updating them as frames arrive.
+// Menu button closes the dashboard.
+void show_edt_dashboard()
+{
+    // wait for the button press that got us here to clear
+    while (digitalRead(PIN_MENU_IN) == LOW || digitalRead(PIN_FIRE_IN) == LOW) delay(10);
+    delay(50); // debounce
+
+    bool exit_requested = false;
+    while (!exit_requested)
+    {
+        uint32_t now = millis();
+        uint32_t left_edt_ms = left_motor->get_last_edt_frame_ms();
+        uint32_t right_edt_ms = right_motor->get_last_edt_frame_ms();
+        bool left_live = (left_edt_ms != 0) && (now - left_edt_ms < 3000);
+        bool right_live = (right_edt_ms != 0) && (now - right_edt_ms < 3000);
+
+        oled.clearDisplay();
+        oled.setFont();
+        oled.setTextSize(1);
+        oled.setCursor(0, 0);
+        oled.print(F("EDT     Left  Right"));
+        oled.setCursor(0, 10);  oled.print(F("Volt"));
+        oled.setCursor(48, 10); oled.print(left_motor->get_current_voltage(), 2);
+        oled.setCursor(90, 10); oled.print(right_motor->get_current_voltage(), 2);
+        oled.setCursor(0, 19);  oled.print(F("Amps"));
+        oled.setCursor(48, 19); oled.print((int)left_motor->get_current());
+        oled.setCursor(90, 19); oled.print((int)right_motor->get_current());
+        oled.setCursor(0, 28);  oled.print(F("Temp C"));
+        oled.setCursor(48, 28); oled.print((int)left_motor->get_temperature());
+        oled.setCursor(90, 28); oled.print((int)right_motor->get_temperature());
+        oled.setCursor(0, 37);  oled.print(F("Stress"));
+        oled.setCursor(48, 37); oled.print(left_motor->get_stress());
+        oled.setCursor(90, 37); oled.print(right_motor->get_stress());
+        oled.setCursor(0, 46);  oled.print(F("Status"));
+        oled.setCursor(48, 46); oled.print(F("0x")); oled.print(left_motor->get_status(), HEX);
+        oled.setCursor(90, 46); oled.print(F("0x")); oled.print(right_motor->get_status(), HEX);
+        oled.setCursor(0, 56);
+        oled.print(F("L "));
+        oled.print(left_live ? F("OK") : F("--"));
+        oled.print(F(" R "));
+        oled.print(right_live ? F("OK") : F("--"));
+        oled.print(F(" Menu=exit"));
+        oled.display();
+
+        // refresh ~4x/s, but poll the exit button much faster
+        for (int i = 0; i < 25 && !exit_requested; i++)
+        {
+            if (digitalRead(PIN_MENU_IN) == LOW) exit_requested = true;
+            delay(10);
+        }
+    }
+    while (digitalRead(PIN_MENU_IN) == LOW) delay(10);
+    delay(50); // debounce
 }
 
 void run_pid_autotune()

@@ -225,6 +225,9 @@ void fireNoid();
 void run_pid_autotune();
 std::pair<double,double> fitLog(const int *x, const int *y, int n);
 
+// Live ESC telemetry dashboard (runs on core 1, menu button exits)
+void show_edt_dashboard();
+
 void main_loop();
 
 // The bootup splash screen
