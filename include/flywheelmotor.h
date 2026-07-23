@@ -5,6 +5,17 @@
 #include <stdint.h>
 #include "flywheelcontrolalgorithm.h"
 
+// eRPM plausibility filtering. The bidir DShot checksum is only 4 bits, so
+// roughly 1 in 16 corrupted frames decodes "valid" with a bogus value - and
+// AM32 occasionally sends junk eRPM outright. A flywheel has inertia, so a
+// sample the wheel could not physically have reached since the last accepted
+// sample is corruption, not motion.
+#define RPM_MAX_VALID 50000        // hard ceiling - nothing we run can exceed this
+#define RPM_WINDOW_BASE 1000       // always-allowed deviation (quantization/jitter), rpm
+#define RPM_WINDOW_SLEW_PER_MS 300 // window growth per ms since last good sample (full-throttle spinup measures ~150-200 rpm/ms)
+#define RPM_OUTLIER_AGREE 3000     // consecutive outliers within this of each other are "agreeing", rpm
+#define RPM_OUTLIER_RESYNC 3       // agreeing outliers needed to accept a genuine step change
+
 
 
 class FlywheelMotor {
@@ -25,6 +36,8 @@ private:
     uint32_t stress = 0;
     uint32_t last_edt_frame_ms = 0;   // when the last extended-telemetry frame arrived (0 = never)
     uint32_t last_edt_enable_ms = 0;  // when we last sent the EDT enable burst
+    uint32_t outlier_count = 0;       // consecutive eRPM samples outside the plausibility window
+    uint32_t last_outlier_rpm = 0;    // most recent rejected sample, for the agreement check
     uint32_t update_rpm();
 public:
     FlywheelControlAlgorithm* control_algorithm;

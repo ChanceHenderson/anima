@@ -22,24 +22,61 @@ uint32_t FlywheelMotor::update_rpm()
     uint32_t rpm = 0;
     uint32_t returnValue = 0;
     uint32_t now = micros();
-    uint32_t time_since_last_update = calculate_time_difference_us(now, this->last_good_rpm_timestamp);
 	BidirDshotTelemetryType bdir_type = dshot->getTelemetryPacket(&returnValue);
 	switch (bdir_type) {
         case BidirDshotTelemetryType::ERPM:
+        {
             rpm = returnValue / (this->motor_poles / 2);
-            if (
-                rpm >= 0 &&               // can't have negative RPM
-                rpm <= 50000              // we can't go over 50krpm so if it says we did, it lied
-                ) 
+            if (rpm > RPM_MAX_VALID) // we can't go over 50krpm so if it says we did, it lied
+            {
+                bad_rpm_reads++;
+                break;
+            }
+            // Plausibility gate: flywheel inertia bounds how fast the real RPM
+            // can move, so a sample outside the physically reachable window
+            // since the last accepted sample is corruption (an AM32 hiccup or
+            // a bit flip that survived the 4-bit checksum), not motion. The
+            // window grows with elapsed time, so after a telemetry gap it
+            // opens up and re-syncs on its own.
+            uint32_t elapsed_us = calculate_time_difference_us(this->last_good_rpm_timestamp, now);
+            uint32_t window = RPM_WINDOW_BASE + (elapsed_us / 1000) * RPM_WINDOW_SLEW_PER_MS;
+            uint32_t last = this->actual_rpm;
+            uint32_t diff = (rpm > last) ? (rpm - last) : (last - rpm);
+            if (diff <= window)
             {
                 this->actual_rpm = rpm;
                 this->last_good_rpm_timestamp = now;
+                outlier_count = 0;
             }
             else
             {
-                bad_rpm_reads++;
+                // A genuine step change (hard jam, lost sync) shows up as
+                // repeated outliers that agree with EACH OTHER - accept after
+                // enough consecutive agreeing samples instead of locking out.
+                // Isolated corruption never agrees with itself twice.
+                uint32_t outlier_diff = (rpm > last_outlier_rpm) ? (rpm - last_outlier_rpm) : (last_outlier_rpm - rpm);
+                if (outlier_count > 0 && outlier_diff <= RPM_OUTLIER_AGREE)
+                {
+                    outlier_count++;
+                }
+                else
+                {
+                    outlier_count = 1;
+                }
+                last_outlier_rpm = rpm;
+                if (outlier_count >= RPM_OUTLIER_RESYNC)
+                {
+                    this->actual_rpm = rpm;
+                    this->last_good_rpm_timestamp = now;
+                    outlier_count = 0;
+                }
+                else
+                {
+                    bad_rpm_reads++;
+                }
             }
             break;
+        }
         case BidirDshotTelemetryType::VOLTAGE:
             voltage = (float)returnValue / 4;
             last_edt_frame_ms = millis();
