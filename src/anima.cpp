@@ -282,11 +282,16 @@ void initialize_motors()
     solenoid_dshot = new BidirDShotX1(PIN_SOLENOID_OUT, 600);
     solenoid_dshot->sendThrottle(SOLENOID_OFF);
   }
-    // Arm both ESCs with a stream of zero-throttle packets
+    // Arm ALL THREE ESCs with a stream of zero-throttle packets. The solenoid
+    // channel must be included: an ESC arms only after an uninterrupted run of
+    // zero throttle, and every trigger pull sends it a nonzero pulse that
+    // restarts that count. If it isn't armed here it will ignore fire pulses
+    // until the blaster happens to sit untouched long enough to arm itself.
     for (int i = 0; i < 5000; i++)
     {
         left_motor->get_dshot_instance()->sendThrottle(0);
         right_motor->get_dshot_instance()->sendThrottle(0);
+        if (solenoid_dshot != nullptr) solenoid_dshot->sendThrottle(SOLENOID_OFF);
         uint32_t left_packet;
         uint32_t right_packet;
         BidirDshotTelemetryType bdirtype_left = left_motor->get_dshot_instance()->getTelemetryRaw(&left_packet);
@@ -301,6 +306,7 @@ void initialize_motors()
         delayMicroseconds(100);
         BidirDshotTelemetryType bdirtype_left = left_motor->get_dshot_instance()->getTelemetryRaw(&left_packet);
         BidirDshotTelemetryType bdirtype_right = right_motor->get_dshot_instance()->getTelemetryRaw(&right_packet);
+        if (solenoid_dshot != nullptr) solenoid_dshot->sendThrottle(SOLENOID_OFF);
         delayMicroseconds(200);
     }
 
@@ -318,6 +324,8 @@ void initialize_motors()
     {
         left_motor->send_throttle();   // target is 0, so this streams zero throttle
         right_motor->send_throttle();
+        // keep the solenoid channel fed too - a gap here would undo its arming
+        if (solenoid_dshot != nullptr) solenoid_dshot->sendThrottle(SOLENOID_OFF);
         if (left_motor->get_last_edt_frame_ms() != 0 && right_motor->get_last_edt_frame_ms() != 0) break;
         delayMicroseconds(200);
     }
@@ -425,15 +433,44 @@ void main_loop()
         }
         set_target_rpm(profile_rpm);
         
-        // Wait for spinup
+        // Wait for spinup. Track each wheel's progress so a failure can say
+        // WHY it failed (which wheel, how far it got, when it started moving)
+        // instead of just silently spinning back down.
         unsigned long spinup_start = millis();
-        while (current_rpm_left <= (profile_rpm - SPINUP_RPM_THRESHOLD) || 
+        uint16_t peak_left = 0, peak_right = 0;
+        uint32_t moving_left_ms = 0, moving_right_ms = 0;  // when each wheel first passed 1000 rpm
+        uint32_t ready_left_ms = 0, ready_right_ms = 0;    // when each wheel first hit the threshold
+        while (current_rpm_left <= (profile_rpm - SPINUP_RPM_THRESHOLD) ||
                current_rpm_right <= (profile_rpm - SPINUP_RPM_THRESHOLD))
         {
-          if (millis() - spinup_start > REV_FAIL_TIMER)
+          uint16_t rpm_l = current_rpm_left;
+          uint16_t rpm_r = current_rpm_right;
+          uint32_t elapsed = millis() - spinup_start;
+          if (rpm_l > peak_left) peak_left = rpm_l;
+          if (rpm_r > peak_right) peak_right = rpm_r;
+          if (moving_left_ms == 0 && rpm_l > 1000) moving_left_ms = elapsed;
+          if (moving_right_ms == 0 && rpm_r > 1000) moving_right_ms = elapsed;
+          if (ready_left_ms == 0 && rpm_l > (profile_rpm - SPINUP_RPM_THRESHOLD)) ready_left_ms = elapsed;
+          if (ready_right_ms == 0 && rpm_r > (profile_rpm - SPINUP_RPM_THRESHOLD)) ready_right_ms = elapsed;
+          if (elapsed > REV_FAIL_TIMER)
           {
-            // Failed to spin up - abort
+            // Failed to spin up - report why, then abort
+            Serial.printf("SPINUP FAIL target=%u thresh=%u | L peak=%u moving@%lums ready@%lums | R peak=%u moving@%lums ready@%lums\n",
+                          profile_rpm, profile_rpm - SPINUP_RPM_THRESHOLD,
+                          peak_left, (unsigned long)moving_left_ms, (unsigned long)ready_left_ms,
+                          peak_right, (unsigned long)moving_right_ms, (unsigned long)ready_right_ms);
             rev_down();
+            oled.clearDisplay();
+            oled.setFont();
+            oled.setTextSize(1);
+            oled.setCursor(0, 0);  oled.print(F("SPINUP FAIL"));
+            oled.setCursor(0, 14); oled.print(F("L ")); oled.print(peak_left);
+            oled.print(F(" @")); oled.print(moving_left_ms); oled.print(F("ms"));
+            oled.setCursor(0, 26); oled.print(F("R ")); oled.print(peak_right);
+            oled.print(F(" @")); oled.print(moving_right_ms); oled.print(F("ms"));
+            oled.setCursor(0, 40); oled.print(F("need ")); oled.print(profile_rpm - SPINUP_RPM_THRESHOLD);
+            oled.display();
+            update_display = true;
             while (trig.depressed)
             {
               trig.Update();
